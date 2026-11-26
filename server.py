@@ -112,6 +112,8 @@ def parse_params(raw: dict | None) -> tuple[Params, bool, bool]:
         min_solidity=float(raw.get("solidity", d.min_solidity)),
         rel_min_pct=int(raw.get("rel", d.rel_min_pct)),
         split=bool(raw.get("split", d.split)), split_level=float(raw.get("level", d.split_level)),
+        method=str(raw.get("method", d.method)) if str(raw.get("method", d.method)) in ("background", "colour") else d.method,
+        bg_sens=float(raw.get("sens", d.bg_sens)),
     )
     return p, bool(raw.get("ids", False)), bool(raw.get("tilted", False))
 
@@ -210,7 +212,8 @@ def status():
                      "val": [defaults.v_min, defaults.v_max], "blur": defaults.blur, "open": defaults.open_iter,
                      "close": defaults.close_iter, "area": [defaults.min_area, defaults.max_area],
                      "aspect": [defaults.min_aspect, defaults.max_aspect], "solidity": defaults.min_solidity,
-                     "rel": defaults.rel_min_pct, "split": defaults.split, "level": defaults.split_level},
+                     "rel": defaults.rel_min_pct, "split": defaults.split, "level": defaults.split_level,
+                     "method": defaults.method, "sens": defaults.bg_sens},
         "categories": gr.CATEGORY_COLORS if gr else {},
         "category_defs": gr.CATEGORY_DEFINITIONS if gr else {},
         "classes": gt.CLASSES if gt else [], "colors": gt.COLORS if gt else {},

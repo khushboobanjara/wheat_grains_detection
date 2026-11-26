@@ -108,3 +108,15 @@ Colour-based detection depends on lighting and background. Heavily stacked grain
 background the same colour as the wheat need manual slider tuning. Measurements are in pixels (no physical
 calibration). The trained model's confidence is the share of decision trees that voted for a type, not a calibrated probability, and it only knows what your training photos showed (other camera, lighting or wheat variety → re-train). Groq confidence values are the model's own estimate, not a measured accuracy. Uploaded images are
 kept in server memory only (the 40 most recent) and are lost when the server restarts.
+
+## Detection update: finding every grain
+
+The detector no longer depends on a colour range. The default **"Any colour"** method builds a
+model of the background and segments everything that differs from it, so green, golden, dark
+brown, pale and broken grains are all found. Touching grains are separated with a seeded
+watershed (seeds sized from the isolated grains in the photo, retried more sensitively on
+piles), and slivers are merged back into their neighbour.
+
+Settings → *Detection method*:
+- **Sensitivity**: lower finds fainter grains (may pick up shadows), higher is stricter.
+- **Colour range only** keeps the previous HSV behaviour.

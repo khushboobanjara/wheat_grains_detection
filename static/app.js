@@ -55,7 +55,7 @@ const curFile = () => S.files[S.cur];
 function payload() {
   const s = S.set;
   return { hue: s.hue, sat: s.sat, val: s.val, auto: s.auto, blur: s.blur, open: s.open, close: s.close, area: s.area,
-           aspect: s.aspect, solidity: s.solidity, rel: s.rel, split: s.split, level: s.level, ids: s.ids, tilted: s.tilted };
+           aspect: s.aspect, solidity: s.solidity, method: s.method, sens: s.sens, rel: s.rel, split: s.split, level: s.level, ids: s.ids, tilted: s.tilted };
 }
 const detKey = () => { const p = payload(); delete p.ids; delete p.tilted; return JSON.stringify(p); };
 function dlUrl(kind) {
@@ -163,6 +163,10 @@ const legend = (m) => `<div class="legend">${Object.entries(m).map(([k, c]) => `
 
 /* -------------------------------------------------------- settings panel */
 const GROUPS = [
+  { title: "Detection method", open: true, items: [
+    { t: "select", k: "method", label: "Method", options: [["background", "Any colour (recommended): finds every grain"], ["colour", "Colour range only (HSV, legacy)"]],
+      hint: "'Any colour' detects everything that differs from the background, so green, golden, dark and pale grains are all found. The colour sliders below are only used by the legacy method." },
+    { t: "range", k: "sens", min: 0.3, max: 1.5, step: 0.05, label: "Sensitivity (any-colour method)", hint: "Lower = finds fainter grains (may pick up shadows). Higher = stricter." } ] },
   { title: "Colour range (HSV)", open: true, items: [
     { t: "preset" },
     { t: "dual", k: "hue", min: 0, max: 179, step: 1, label: "Hue" },
@@ -224,13 +228,18 @@ function makeControl(def) {
   if (def.t === "preset") {
     w.innerHTML = `<label for="presetSel"><span>Colour preset</span></label><select id="presetSel" style="width:100%">${Object.keys(S.cfg.presets).map((p) => `<option>${esc(p)}</option>`).join("")}</select><div class="hint">Starting point for the HSV colour range. Changing it resets the three colour sliders.</div>`;
     const sel = $("select", w);
-    sel.onchange = () => { const p = S.cfg.presets[sel.value]; S.set.preset = sel.value; S.set.hue = [...p.hue]; S.set.sat = [...p.sat]; S.set.val = [...p.val]; syncControls(); changed("preset"); };
+    sel.onchange = () => { const p = S.cfg.presets[sel.value]; S.set.preset = sel.value; S.set.method = "colour"; S.set.hue = [...p.hue]; S.set.sat = [...p.sat]; S.set.val = [...p.val]; syncControls(); changed("preset"); };
     ctrls.preset = { update: () => { sel.value = S.set.preset; } };
   } else if (def.t === "check") {
     w.innerHTML = `<label class="check"><input type="checkbox"><span>${esc(def.label)}</span></label>`;
     const cb = $("input", w);
     cb.onchange = () => { S.set[def.k] = cb.checked; changed(def.k); };
     ctrls[def.k] = { update: () => { cb.checked = !!S.set[def.k]; } };
+  } else if (def.t === "select") {
+    w.innerHTML = `<label><span>${esc(def.label)}</span></label><select style="width:100%">${def.options.map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join("")}</select>${hint}`;
+    const sel = $("select", w);
+    sel.onchange = () => { S.set[def.k] = sel.value; changed(def.k); };
+    ctrls[def.k] = { update: () => { sel.value = S.set[def.k]; } };
   } else if (def.t === "range") {
     w.innerHTML = `<label><span>${esc(def.label)}</span><span class="val"></span></label><input type="range" min="${def.min}" max="${def.max}" step="${def.step}">${hint}`;
     const r = $("input", w), v = $(".val", w);
