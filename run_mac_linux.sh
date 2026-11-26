@@ -9,4 +9,4 @@ if [ ! -d venv ]; then
 else
   source venv/bin/activate
 fi
-streamlit run app.py
+python server.py

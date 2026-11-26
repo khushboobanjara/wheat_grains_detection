@@ -9,5 +9,6 @@ if not exist venv (
 ) else (
     call venv\Scripts\activate
 )
-streamlit run app.py
+start "" http://localhost:8000
+python server.py
 pause
