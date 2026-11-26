@@ -25,7 +25,8 @@ Use another port with `PORT=9000 python server.py` (Windows: `set PORT=9000`).
 |---|---|
 | **Overview** | KPI cards (grain count, average size, size variation, processing time), view switcher (side-by-side / processed / original / mask), size-distribution histogram, summary statistics |
 | **Detection** | Segmentation mask, active settings, sortable per-grain table with small/large outlier flag |
-| **Quality** | *(optional, Groq)* Sound / Shrivelled / Immature / Broken / Damaged-Discoloured per grain, charts, manual-inspection flags, observations, detailed report |
+| **Train** | Label grains yourself (click + keys 1-5), train your own classifier, predict another photo and see its accuracy + confusion matrix |
+| **Quality** | Full report table with the grain types (Sound / Shrivelled / Immature / Broken / Damaged-Discoloured) as rows: count, % by count, % by area, average size, confidence, review flags. Source: your trained model, or optional Groq |
 | **AI report** | *(optional, Groq)* Written visual analysis of colour, shape, uniformity and defects |
 | **Export** | Processed PNG, mask PNG, grain CSV, classification PDF + CSVs, AI report (MD/TXT) |
 | **Batch** | Appears when you upload several images: grains per image, totals, chart, CSV |
@@ -33,6 +34,12 @@ Use another port with `PORT=9000 python server.py` (Windows: `set PORT=9000`).
 The right-hand **Detection settings** panel holds the colour preset, HSV range, clean-up, shape filters,
 touching-grain splitting and display options, plus **Reset all settings**. Results update live as you move a slider.
 Other touches: drag-and-drop upload, click-to-enlarge images, light/dark theme, responsive layout.
+
+## Train your own model (no API key)
+1. Upload photo 1, open **Train**, click each grain and choose its type (or press 1-5). Keys: `0` clear, arrows / `N` move.
+2. **Add labelled grains to training set**, then **Train model**. Labels are saved in `training_data/`, the model in `models/`.
+3. Upload a different photo, press **Predict this photo**, then give the true type of the grains: accuracy, per-type recall/precision and a confusion matrix appear. Corrected photos can be added to the training set to improve the model.
+The **Quality** tab then fills the report table automatically for every photo. Needs `scikit-learn` (in requirements.txt).
 
 ## Optional: Groq key
 1. Create a free key at https://console.groq.com/keys
@@ -60,6 +67,7 @@ you click *Classify grains with Groq* or *Generate AI report*. Never share or co
 | `static/style.css` | Design system, light/dark themes, responsive rules |
 | `static/app.js` | Dashboard logic, charts (inline SVG), tables, API calls. No external libraries |
 | `wheat_detector.py` | Detection pipeline (unchanged) |
+| `grain_trainer.py` | Feature extraction, training-set store, Random Forest model |
 | `groq_analyzer.py`, `grain_report.py` | Optional Groq classification, report, PDF/CSV (unchanged) |
 
 ## Limitations

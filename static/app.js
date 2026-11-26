@@ -18,10 +18,15 @@ const S = {
   det: null,                 // last detection result
   view: "side", metric: "length", onlyOut: false, sort: { key: "id", dir: 1 },
   cls: null, clsRunning: false, clsSub: 0, clsShown: null, clsOnlyFlag: false,
+  train: null,               // /api/train/state (training set + model info)
+  truth: {}, dirty: {},      // sid -> labels you gave [{cx, cy, label}] / unsaved-changes flag
+  pred: {}, showPred: {},    // sid -> model predictions / show them on the photo
+  sel: null, zoom: 1, showIds: true, trainBusy: false,
+  qsrc: "model", qShown: null, qOnlyReview: false,
   ai: null, aiKey: "", aiRunning: false,
   batch: null, batchKey: "",
 };
-const TITLES = { overview: "Overview", detection: "Detection", quality: "Quality classification", ai: "AI report", export: "Export", batch: "Batch comparison" };
+const TITLES = { overview: "Overview", detection: "Detection", train: "Train your model", quality: "Grain quality report", ai: "AI report", export: "Export", batch: "Batch comparison" };
 const ctrls = {};
 let detectToken = 0, detectTimer = null, clsTimer = null, busyCount = 0;
 
@@ -180,9 +185,9 @@ const GROUPS = [
   { title: "Display", items: [
     { t: "check", k: "ids", label: "Number the grains" },
     { t: "check", k: "tilted", label: "Tilted boxes (rotated rectangles)" } ] },
-  { title: "Classification (optional)", items: [
-    { t: "range", k: "thr", min: 0, max: 1, step: 0.05, label: "Manual-inspection threshold", pct: true, hint: "Grains classified below this confidence are flagged. Updates instantly; no new Groq calls." },
-    { t: "range", k: "cbatch", min: 1, max: 5, step: 1, label: "Grains per Groq request", hint: "1 = most faithful but most API calls. Higher = fewer calls." } ] },
+  { title: "Quality grading", items: [
+    { t: "range", k: "thr", min: 0, max: 1, step: 0.05, label: "Manual-inspection threshold", pct: true, hint: "Grains graded below this confidence are flagged for review. Updates instantly; no new Groq calls." },
+    { t: "range", k: "cbatch", min: 1, max: 5, step: 1, label: "Grains per Groq request (Groq only)", hint: "1 = most faithful but most API calls. Higher = fewer calls." } ] },
 ];
 const DEFAULT_EXTRA = { auto: false, ids: false, tilted: false, thr: 0.7, cbatch: 1, preset: "" };
 const fmtV = (def, v) => (def.pct ? Math.round(v * 100) + "%" : def.step < 1 ? Number(v).toFixed(2) : n0(v));
@@ -195,8 +200,9 @@ function resetSettings() {
 }
 function syncControls() { Object.values(ctrls).forEach((c) => c.update()); }
 function changed(key) {
-  if (key === "thr") { clearTimeout(clsTimer); clsTimer = setTimeout(refreshCls, 250); return; }
+  if (key === "thr") { clearTimeout(clsTimer); clsTimer = setTimeout(async () => { await refreshCls(true); if (S.det && ["overview", "quality"].includes(S.tab)) render(); }, 250); return; }
   if (key === "cbatch") { if (S.tab === "quality") render(); return; }
+  if (S.det) S.sel = null;
   clearTimeout(detectTimer);
   detectTimer = setTimeout(runDetect, 300);
 }
@@ -253,6 +259,8 @@ function makeControl(def) {
 async function uploadFiles(list) {
   const files = [...list];
   if (!files.length) return;
+  const unsaved = S.files.some((f) => S.dirty[f.sid] && !S.showPred[f.sid] && (S.truth[f.sid] || []).length);
+  if (unsaved && !confirm("You have labels that are not yet added to the training set. Upload new photos and discard them?\n\n(Cancel, then use “Add labelled grains to training set” in the Train tab to keep them.)")) return;
   const fd = new FormData();
   files.forEach((f) => fd.append("files", f));
   busy(true);
@@ -264,6 +272,8 @@ async function uploadFiles(list) {
     const ok = j.files.filter((f) => f.sid);
     if (!ok.length) return;
     S.files = ok; S.cur = 0; S.originals = {};
+    S.truth = {}; S.dirty = {}; S.pred = {}; S.showPred = {}; S.sel = null;
+    Object.keys(cropImgs).forEach((k) => delete cropImgs[k]);
     S.batch = null; S.batchKey = "";
     afterFileChange();
     toast(`${ok.length} image${ok.length > 1 ? "s" : ""} ready.`, true);
@@ -284,7 +294,7 @@ function afterFileChange() {
   if (S.tab === "batch" && S.files.length < 2) S.tab = "overview";
 }
 async function selectFile(i) {
-  S.cur = i; S.det = null; S.cls = null; S.ai = null; S.clsSub = 0; S.clsShown = null;
+  S.cur = i; S.det = null; S.cls = null; S.ai = null; S.clsSub = 0; S.clsShown = null; S.sel = null;
   $("#fileSelect").value = i;
   render();
   const f = curFile();
@@ -347,28 +357,20 @@ function loadingView() { return `<div class="card card-pad empty"><div class="sp
 
 
 function conditionCard() {
-  const cfg = S.cfg, n = S.det.stats.count, c = S.cls, colors = cfg.categories, defs = cfg.category_defs || {};
-  const batch = S.set.cbatch, calls = Math.ceil(n / batch) || 0;
-  const done = c && c.state === "ok";
+  const n = S.det.stats.count, tr = S.train, qd = qualityData(), defs = S.cfg.class_defs || {};
   let body = "";
-  if (!cfg.ai_available) body += callout("info", "Grain classification is unavailable in this installation.");
-  else if (!cfg.groq) body += callout("info", "Add your Groq API key to the .env file and reload the page to grade each grain (Sound, Shrivelled, Immature, Broken, Damaged/Discoloured).");
-  if (c && c.state === "stale") body += callout("warn", "Detection settings changed since the last analysis, so the grain IDs no longer match. Run the analysis again.");
-  if (c && c.state === "error") body += callout("bad", c.error);
-  if (done) {
-    const s = c.summary;
-    if (c.fatal_error) body += callout("bad", c.fatal_error) + (c.hint ? `<div class="small muted">${esc(c.hint)}</div>` : "");
-    body += `<div class="cond-grid">${s.categories.map((x) => `<div class="cond" style="--c:${colors[x.category]}" title="${esc(defs[x.category] || "")}">
-      <div class="nm">${esc(x.category)}</div><div class="ct">${x.count}</div><div class="pc">${x.percent.toFixed(1)}% of classified</div></div>`).join("")}</div>`;
-    const items = s.categories.map((x) => ({ label: x.category, value: x.count, color: colors[x.category] }));
-    if (s.classified) body += `<div class="grid-2"><div>${barSvg(items)}</div><div>${donutSvg(items)}</div></div>`;
-    body += `<div class="small muted" style="margin:10px 0">${s.classified} of ${s.total_detected} grains classified${s.unclassified ? `, ${s.unclassified} could not be classified` : ""}; ${s.flagged_total} flagged for manual inspection. Per-grain results and the colour-coded image are in the Quality tab.</div>`;
-  }
-  body += `<div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-top:6px">
-    <button class="btn primary" id="clsBtn" ${!cfg.ai_available || !cfg.groq || !n || S.clsRunning ? "disabled" : ""}>${S.clsRunning ? "Analysing…" : done ? "Re-run analysis" : "Analyse grain condition"}</button>
-    <span class="small muted">${n ? `${n} grains will be sent to Groq in ${calls} request${calls !== 1 ? "s" : ""}. Nothing is sent until you click.` : "No grains detected yet."}</span></div>
-    <div class="progress ${S.clsRunning ? "" : "hidden"}" style="margin-top:12px"><div id="clsBar"></div></div><div class="small muted ${S.clsRunning ? "" : "hidden"}" id="clsTxt" style="margin-top:6px"></div>`;
-  return `<div class="card card-pad">${head("Grain condition", "Each grain is graded as Sound, Shrivelled, Immature, Broken or Damaged/Discoloured. OpenCV does the counting; Groq judges each grain's close-up.")}${body}</div>`;
+  if (qd) {
+    const q = qualityTable(qd.rows);
+    body += `<div class="cond-grid">${q.cats.filter((x) => x.cat !== "Unclassified" || x.count).map((x) => `<div class="cond" style="--c:${colorOf(x.cat)}" title="${esc(defs[x.cat] || "")}">
+      <div class="nm">${esc(x.cat)}</div><div class="ct">${x.count}</div><div class="pc">${pc1(x.pct)} of graded</div></div>`).join("")}</div>
+      <div class="small muted" style="margin-bottom:10px">${q.total.count} grains graded by ${esc(qd.source)}; ${q.total.review} flagged for manual review.</div>`;
+  } else if (S.qsrc === "model") {
+    if (!tr || !tr.available) body += callout("info", (tr && tr.reason) || "Training is unavailable in this installation.");
+    else if (!tr.model.trained) body += callout("info", "No model trained yet. Label a few grains in the Train tab to grade grains as Sound, Shrivelled, Immature, Broken or Damaged/Discoloured.");
+    else if (n) body += `<div class="small muted" style="margin-bottom:10px">Grading ${n} grains…</div>`;
+  } else body += callout("info", "Run the Groq classification in the Quality tab to see the grain types here.");
+  body += `<div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn primary" id="goQuality">Open the full quality table</button><button class="btn" id="goTrain">${tr && tr.model.trained ? "Improve your model" : "Train your own model"}</button></div>`;
+  return `<div class="card card-pad">${head("Grain condition", "Grain types counted from the photo. The detailed table, with one row per grain type, is in the Quality tab.")}${body}</div>`;
 }
 
 function viewOverview() {
@@ -408,8 +410,9 @@ function viewOverview() {
   return html;
 }
 function bindOverview() {
-  const cb = $("#clsBtn");
-  if (cb) cb.onclick = runClassify;
+  const gq = $("#goQuality"), gtr = $("#goTrain");
+  if (gq) gq.onclick = () => setTab("quality");
+  if (gtr) gtr.onclick = () => setTab("train");
   $$("#viewSeg button").forEach((b) => (b.onclick = () => { S.view = b.dataset.v; render(); }));
   const sel = $("#metricSel");
   const draw = () => {
@@ -457,87 +460,552 @@ function bindDetection() {
   drawGrainTable();
 }
 
-/* ---- quality (Groq classification) ---- */
-function viewQuality() {
-  const n = S.det.stats.count, cfg = S.cfg, c = S.cls;
-  const batch = S.set.cbatch, calls = Math.ceil(n / batch) || 0;
-  let html = `<div class="card card-pad">${head("Grain quality classification",
-    "OpenCV detects, counts, boxes and measures every grain. Groq then looks at each grain's own crop and assigns one category: Sound, Shrivelled, Immature, Broken or Damaged/Discoloured. Uncertain or failed grains are flagged for manual inspection, never guessed.")}`;
-  if (!cfg.ai_available) html += callout("info", "Grain classification is unavailable in this installation.");
-  else {
-    if (!cfg.groq) html += callout("info", "Optional feature: add your Groq API key to the .env file (see .env.example) and reload the page to enable it. Everything else works without it.");
-    html += `<div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-top:12px">
-      <button class="btn primary" id="clsBtn" ${!cfg.groq || !n || S.clsRunning ? "disabled" : ""}>Classify grains with Groq</button>
-      <span class="small muted">${n ? `${n} grains will be sent in ${calls} request${calls !== 1 ? "s" : ""} (${batch} per request). Clicking the button uploads the grain crops to Groq. Free-tier rate limits may slow this down.` : "No grains detected yet, so there is nothing to classify."}</span></div>
-      <div class="progress ${S.clsRunning ? "" : "hidden"}" style="margin-top:12px"><div id="clsBar"></div></div><div class="small muted ${S.clsRunning ? "" : "hidden"}" id="clsTxt" style="margin-top:6px"></div>`;
+/* ======================================================================== */
+/*  Shared helpers: your labels, model predictions, image overlay            */
+/* ======================================================================== */
+const modelTrained = () => !!(S.train && S.train.available && S.train.model.trained);
+const modelVer = () => (S.train && S.train.model.version) || "";
+const predKey = () => detKey() + "|" + modelVer();
+const gCenter = (g) => [g.x + g.box_w / 2, g.y + g.box_h / 2];
+const mean = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null);
+const colorOf = (c) => S.cfg.colors[c] || "#7f7f7f";
+
+/* Labels you give are remembered by grain position, so they survive changes of the detection settings. */
+const gTol = (g) => Math.max(8, Math.min(g.box_w, g.box_h) * 0.6);
+function nearestIdx(list, g) {
+  const [cx, cy] = gCenter(g), t = gTol(g);
+  let bi = -1, bd = t * t;
+  list.forEach((e, i) => { const d = (e.cx - cx) ** 2 + (e.cy - cy) ** 2; if (d <= bd) { bd = d; bi = i; } });
+  return bi;
+}
+function truthMap() {
+  const list = S.truth[curFile().sid] || [], m = {};
+  S.det.grains.forEach((g) => { const i = nearestIdx(list, g); if (i >= 0) m[g.id] = list[i].label; });
+  return m;
+}
+function setTruth(g, label) {
+  const sid = curFile().sid, list = (S.truth[sid] = S.truth[sid] || []);
+  const i = nearestIdx(list, g);
+  if (i >= 0) list.splice(i, 1);
+  if (label) { const [cx, cy] = gCenter(g); list.push({ cx, cy, label }); }
+  S.dirty[sid] = true;
+}
+
+/* Predictions of your trained model, cached per image + detection settings + model version. */
+const predRows = (sid = curFile().sid) => { const p = S.pred[sid]; return p && p.key === predKey() ? p.rows : null; };
+function predMap() { const m = {}; (predRows() || []).forEach((r) => (m[r.id] = r)); return m; }
+async function ensurePred(sids) {
+  if (!modelTrained()) return false;
+  const key = predKey(), need = sids.filter((s) => !(S.pred[s] && S.pred[s].key === key));
+  if (!need.length) return false;
+  busy(true);
+  try {
+    const r = await api("/api/train/predict", { sids: need, params: payload() });
+    if (key !== predKey()) return false;                       // settings or model changed meanwhile
+    need.forEach((s) => { const x = r.results[s] || {}; S.pred[s] = { key, rows: x.error ? [] : x.rows || [], error: x.error || "" }; });
+    return true;
+  } catch (e) {
+    need.forEach((s) => (S.pred[s] = { key, rows: [], error: e.message }));   // stop retrying until something changes
+    toast(e.message);
+    return true;
+  } finally { busy(false); }
+}
+async function autoPred() {
+  if (!S.det || !modelTrained()) return;
+  const sid = curFile().sid, tab = S.tab;
+  if (tab === "train") {
+    if (S.showPred[sid] && (await ensurePred([sid])) && S.tab === "train") refreshTrain();
+  } else if (tab === "quality" && S.qsrc === "model") {
+    if (await ensurePred([sid])) render();
+    const others = S.files.map((f) => f.sid).filter((s) => s !== sid);
+    if (others.length && (await ensurePred(others)) && S.tab === "quality") render();
+  } else if (["overview", "export"].includes(tab) && S.qsrc === "model") {
+    if ((await ensurePred([sid])) && S.tab === tab) render();
   }
-  html += `</div>`;
-  if (!c || c.state === "none") return html;
-  if (c.state === "stale") return html + callout("warn", "These classification results belong to a different image or detection settings, so the grain IDs no longer match. Click 'Classify grains with Groq' to classify the current detection.");
-  if (c.state === "error") return html + callout("bad", c.error) + `<div class="small muted">Detection results are unaffected.</div>`;
+}
 
-  const s = c.summary;
-  if (c.fatal_error) html += callout("bad", c.fatal_error) + (c.hint ? `<div class="small muted">${esc(c.hint)}</div>` : "");
-  html += `<div class="kpis">
-    ${kpi("Grains detected", s.total_detected, "", "neutral")}${kpi("Classified", s.classified, "", "good")}
-    ${kpi("Not classified", s.unclassified, "", s.unclassified ? "bad" : "neutral")}
-    ${kpi("Manual inspection", s.flagged_total, `threshold ${Math.round(c.threshold * 100)}%`, s.flagged_total ? "warn" : "good")}</div>`;
-  html += callout(s.reconciled ? "ok" : "bad", (s.reconciled ? "Counts reconcile: " : "Counts do not reconcile: ") + c.reconciliation);
+/* The image with one clickable box per grain (SVG drawn on top of the photo). */
+function stageShell(id, zoom = 1) {
+  const src = S.originals[curFile().sid];
+  return `<div class="stage-wrap" id="${id}Wrap"><div class="stage" id="${id}Stage" style="width:${zoom * 100}%"><img src="${src}" alt="Grain photo" draggable="false"><svg class="ov" id="${id}Svg"></svg></div></div>`;
+}
+function fillOverlay(svg, styleFn, selId, showIds) {
+  const d = S.det, W = d.width, H = d.height, fs = Math.max(10, W / 80);
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const gs = [...d.grains].sort((a, b) => b.area - a.area);        // big first, small grains stay clickable on top
+  let boxes = "", txt = "", sel = "";
+  gs.forEach((g) => {
+    const s = styleFn(g);
+    boxes += `<rect data-id="${g.id}" x="${g.x}" y="${g.y}" width="${g.box_w}" height="${g.box_h}" rx="3" fill="${s.color}" fill-opacity="${s.fill}" stroke="${s.color}" stroke-width="${s.w || 2}"${s.dash ? ' stroke-dasharray="5 3"' : ""}><title>${esc(s.tip || "")}</title></rect>`;
+    if (showIds) txt += `<text x="${g.x}" y="${g.y - 3}" font-size="${fs}" style="stroke-width:${(fs * 0.22).toFixed(1)}px">${g.id}${s.star ? "*" : ""}</text>`;
+    if (g.id === selId) sel = `<rect x="${g.x - 3}" y="${g.y - 3}" width="${g.box_w + 6}" height="${g.box_h + 6}" rx="5" fill="none" stroke="#111" stroke-width="5" pointer-events="none"/><rect x="${g.x - 3}" y="${g.y - 3}" width="${g.box_w + 6}" height="${g.box_h + 6}" rx="5" fill="none" stroke="#fff" stroke-width="2" pointer-events="none"/>`;
+  });
+  svg.innerHTML = boxes + sel + txt;
+}
 
-  const tabs = ["Summary & charts", "Per-grain results", "Observations & recommendations", "Detailed report"];
-  html += `<div class="card card-pad"><div class="subtabs" id="clsTabs">${tabs.map((t, i) => `<button data-i="${i}" class="${S.clsSub === i ? "on" : ""}">${t}</button>`).join("")}</div><div id="clsPane"></div></div>`;
+/* ======================================================================== */
+/*  Quality report: grain types as parameters, shown as a table              */
+/* ======================================================================== */
+function qualityData() {
+  if (S.qsrc === "groq") {
+    const c = S.cls;
+    if (!c || c.state !== "ok") return null;
+    return { source: `Groq (${c.model || "vision model"})`,
+      rows: c.rows.map((r) => ({ id: r.id, category: r.category, confidence: r.confidence, length: r.length_px, width: r.width_px, area: r.area_px,
+        review: r.manual_inspection === "Required", reason: r.review_reasons || "" })) };
+  }
+  const rows = predRows();
+  if (!rows) return null;
+  const thr = S.set.thr;
+  return { source: `Your trained model (${S.train.model.n_samples} training grains)`,
+    rows: rows.map((r) => ({ id: r.id, category: r.label, confidence: r.confidence, length: r.length, width: r.width, area: r.area,
+      review: r.confidence < thr, reason: r.confidence < thr ? `Confidence below ${Math.round(thr * 100)}%` : "" })) };
+}
+function qualityTable(rows) {
+  const cats = [...S.cfg.classes];
+  const unc = rows.filter((r) => r.category === "Unclassified");
+  if (unc.length) cats.push("Unclassified");
+  const graded = rows.filter((r) => r.category !== "Unclassified"), tot = graded.length, totArea = graded.reduce((a, r) => a + r.area, 0);
+  const agg = (items, isUnc) => {
+    const conf = items.filter((r) => r.confidence != null).map((r) => r.confidence), a = items.reduce((s, r) => s + r.area, 0);
+    return { count: items.length, pct: isUnc ? null : tot ? (items.length / tot) * 100 : 0, areaPct: isUnc ? null : totArea ? (a / totArea) * 100 : 0,
+      avgL: mean(items.map((r) => r.length)), avgW: mean(items.map((r) => r.width)), avgA: mean(items.map((r) => r.area)),
+      conf: mean(conf), review: items.filter((r) => r.review).length };
+  };
+  return { cats: cats.map((c) => ({ cat: c, ...agg(rows.filter((r) => r.category === c), c === "Unclassified") })),
+    total: agg(graded), defective: agg(graded.filter((r) => r.category !== "Sound")), unclassified: unc.length };
+}
+const pc1 = (v) => (v == null ? "-" : v.toFixed(1) + "%");
+const dash = (v, f) => (v == null ? "-" : f(v));
+function qualityTableHtml(q) {
+  const defs = S.cfg.class_defs || {};
+  const row = (name, x, o = {}) => `<tr class="${o.cls || ""}">
+    <td class="pname">${o.color ? `<i class="sw" style="background:${o.color}"></i>` : ""}<div><b>${esc(name)}</b>${o.sub ? `<div class="psub">${esc(o.sub)}</div>` : ""}</div></td>
+    <td class="num"><b>${x.count}</b></td>
+    <td class="num">${x.pct == null ? "-" : `<div class="pcell"><span>${pc1(x.pct)}</span><div class="pbar"><i style="width:${Math.min(100, x.pct)}%;background:${o.color || "var(--primary)"}"></i></div></div>`}</td>
+    <td class="num">${pc1(x.areaPct)}</td><td class="num">${dash(x.avgL, n1)}</td><td class="num">${dash(x.avgW, n1)}</td><td class="num">${dash(x.avgA, n0)}</td>
+    <td class="num">${x.conf == null ? "-" : Math.round(x.conf * 100) + "%"}</td><td class="num">${x.review ? `<span class="tag Required">${x.review}</span>` : "0"}</td></tr>`;
+  return `<div class="table-wrap qwrap"><table class="qtable"><thead><tr>
+    <th>Parameter (grain type)</th><th class="num">Grains</th><th class="num">% by count</th><th class="num" title="Share of the total grain pixel area, a stand-in for weight share">% by area*</th>
+    <th class="num">Avg length (px)</th><th class="num">Avg width (px)</th><th class="num">Avg area (px²)</th><th class="num">Avg confidence</th><th class="num">Needs review</th></tr></thead><tbody>
+    ${q.cats.map((x) => row(x.cat, x, { color: colorOf(x.cat), sub: x.cat === "Unclassified" ? "Could not be graded" : defs[x.cat] })).join("")}
+    ${row("Total graded", q.total, { cls: "qtotal" })}
+    ${row("Defective grains (all types except Sound)", q.defective, { cls: "qdef" })}</tbody></table></div>`;
+}
+function csvDownload(name, matrix) {
+  const q = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob(["﻿" + matrix.map((r) => r.map(q).join(",")).join("\n")], { type: "text/csv" }));
+  a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+function qualityCsv() {
+  const qd = qualityData(); if (!qd) return;
+  const q = qualityTable(qd.rows), r1 = (v, k) => (v == null ? "" : +v.toFixed(k));
+  const line = (name, x) => [name, x.count, r1(x.pct, 1), r1(x.areaPct, 1), r1(x.avgL, 1), r1(x.avgW, 1), r1(x.avgA, 0), x.conf == null ? "" : r1(x.conf * 100, 0), x.review];
+  csvDownload(`${curFile().name.replace(/\.[^.]+$/, "")}_quality_table.csv`, [
+    ["Parameter (grain type)", "Grains", "% by count", "% by area", "Avg length (px)", "Avg width (px)", "Avg area (px2)", "Avg confidence (%)", "Needs review"],
+    ...q.cats.map((x) => line(x.cat, x)), line("Total graded", q.total), line("Defective grains (all except Sound)", q.defective)]);
+}
+function qualityGrainCsv() {
+  const qd = qualityData(); if (!qd) return;
+  csvDownload(`${curFile().name.replace(/\.[^.]+$/, "")}_quality_per_grain.csv`, [
+    ["Grain ID", "Grain type", "Confidence (%)", "Needs review", "Length (px)", "Width (px)", "Area (px2)"],
+    ...qd.rows.map((r) => [r.id, r.category, r.confidence == null ? "" : Math.round(r.confidence * 100), r.review ? "Yes" : "No", r.length, r.width, r.area])]);
+}
+
+function viewQuality() {
+  const cfg = S.cfg, n = S.det.stats.count, tr = S.train, sid = curFile().sid;
+  const seg = `<div class="seg" id="qSrc">${[["model", "My trained model"], ["groq", "Groq (optional)"]].map(([k, l]) => `<button data-v="${k}" class="${S.qsrc === k ? "on" : ""}">${l}</button>`).join("")}</div>`;
+  let html = `<div class="card card-pad">${head("Grain quality report", "Every detected grain is graded and the results are summed up per grain type. Uncertain grains are flagged for manual inspection, never hidden.", seg)}`;
+  let waiting = false;
+
+  if (S.qsrc === "model") {
+    if (!tr || !tr.available) html += callout("info", (tr && tr.reason) || "Training is unavailable in this installation.");
+    else if (!tr.model.trained) html += callout("info", "No model trained yet. Label some grains in the Train tab and train your model; this table then fills in automatically.") +
+      `<div style="margin-top:12px"><button class="btn primary" id="goTrain">Go to the Train tab</button></div>`;
+    else if (!n) html += callout("warn", "No grains detected, so there is nothing to grade.");
+    else if (!predRows(sid)) { waiting = true; html += `<div class="empty"><div class="spin" style="margin:0 auto 12px"></div>Grading ${n} grains with your model…</div>`; }
+  } else {
+    const batch = S.set.cbatch, calls = Math.ceil(n / batch) || 0;
+    if (!cfg.ai_available) html += callout("info", "Groq classification is unavailable in this installation.");
+    else {
+      if (!cfg.groq) html += callout("info", "Optional: add your Groq API key to the .env file (see .env.example) and reload the page to grade grains with Groq instead of your own model.");
+      html += `<div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-top:6px">
+        <button class="btn primary" id="clsBtn" ${!cfg.groq || !n || S.clsRunning ? "disabled" : ""}>${S.clsRunning ? "Classifying…" : "Classify grains with Groq"}</button>
+        <span class="small muted">${n ? `${n} grains will be sent in ${calls} request${calls !== 1 ? "s" : ""}. Nothing is sent until you click.` : "No grains detected yet."}</span></div>
+        <div class="progress ${S.clsRunning ? "" : "hidden"}" style="margin-top:12px"><div id="clsBar"></div></div><div class="small muted ${S.clsRunning ? "" : "hidden"}" id="clsTxt" style="margin-top:6px"></div>`;
+      if (S.cls && S.cls.state === "stale") html += `<div style="margin-top:10px">${callout("warn", "Detection settings changed since the last Groq run, so the grain IDs no longer match. Classify again.")}</div>`;
+      if (S.cls && S.cls.state === "error") html += `<div style="margin-top:10px">${callout("bad", S.cls.error)}</div>`;
+      if (S.cls && S.cls.state === "ok" && S.cls.fatal_error) html += `<div style="margin-top:10px">${callout("bad", S.cls.fatal_error)}</div>`;
+    }
+  }
+
+  const qd = waiting ? null : qualityData();
+  if (!qd) return html + `</div>`;
+  const q = qualityTable(qd.rows);
+  html += `<div class="rep-meta"><span><b>Sample:</b> ${esc(curFile().name)}</span><span><b>Grains graded:</b> ${q.total.count}</span><span><b>Graded by:</b> ${esc(qd.source)}</span>
+    <span class="grow"></span><button class="btn sm" id="qCsv">${dlIcon} Table (CSV)</button></div>`;
+  html += qualityTableHtml(q);
+  html += `<div class="small muted" style="margin-top:8px">*% by area is each type's share of the total grain pixel area. It approximates the share by weight but is not a measured weight. Lengths and widths are in pixels of the original photo.
+    ${q.unclassified ? `${q.unclassified} grain${q.unclassified > 1 ? "s" : ""} could not be graded and ${q.unclassified > 1 ? "are" : "is"} excluded from the percentages.` : ""}</div></div>`;
+
+  const sound = q.cats.find((x) => x.cat === "Sound");
+  html += `<div class="kpis">${kpi("Grains graded", q.total.count, qd.source.split(" (")[0], "neutral")}${kpi("Sound", pc1(sound.pct), `${sound.count} grains`, sound.pct >= 85 ? "good" : sound.pct >= 60 ? "neutral" : "warn")}
+    ${kpi("Defective", pc1(q.defective.pct), `${q.defective.count} grains`, q.defective.pct <= 10 ? "good" : q.defective.pct <= 30 ? "warn" : "bad")}
+    ${kpi("Needs manual review", q.total.review, `confidence below ${Math.round(S.set.thr * 100)}%`, q.total.review ? "warn" : "good")}</div>`;
+
+  /* all images, grain types as rows */
+  if (S.qsrc === "model" && S.files.length > 1) html += `<div class="card card-pad" id="qMatrix">${matrixHtml()}</div>`;
+
+  html += `<div class="card card-pad">${head("Graded photo", "Box colour = grain type. A dashed box with * is flagged for manual inspection. Hover a grain for details.")}
+    <div class="grid-21"><div>${stageShell("q")}</div><div>
+      <b>Grains per type</b>${barSvg(q.cats.map((x) => ({ label: x.cat, value: x.count, color: colorOf(x.cat) })), { w: 420, h: 250, b: 80 })}
+      <b>Share by count</b>${q.total.count ? donutSvg(q.cats.filter((x) => x.cat !== "Unclassified").map((x) => ({ label: x.cat, value: x.count, color: colorOf(x.cat) }))) : ""}</div></div>
+    ${legend(Object.fromEntries(Object.entries(S.cfg.colors).filter(([k]) => k !== "Unclassified" || q.unclassified)))}</div>`;
+
+  html += `<div class="card card-pad">${head("Per-grain results", "Filter by grain type or show only the grains that need a second look.",
+    `<button class="btn sm" id="qCsv2">${dlIcon} Per-grain (CSV)</button>`)}
+    <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
+      ${q.cats.map((x) => `<label class="check"><input type="checkbox" data-cat="${esc(x.cat)}" ${S.qShown.includes(x.cat) ? "checked" : ""}><i class="sw" style="background:${colorOf(x.cat)}"></i>${esc(x.cat)}</label>`).join("")}
+      <label class="check" style="margin-left:auto"><input type="checkbox" id="qOnlyRev" ${S.qOnlyReview ? "checked" : ""}>Only needs review</label></div><div id="qGrainTable"></div></div>`;
   return html;
 }
-function drawClsPane() {
-  const c = S.cls, pane = $("#clsPane");
-  if (!pane || !c || c.state !== "ok") return;
-  const s = c.summary, colors = S.cfg.categories;
-  if (S.clsSub === 0) {
-    const rows = s.categories.map((x) => `<tr><td><span class="tag cat" style="background:${colors[x.category]}">${esc(x.category)}</span></td><td class="num">${x.count}</td><td class="num">${x.percent.toFixed(1)}%</td><td class="num">${x.flagged}</td></tr>`);
-    rows.push(`<tr><td><b>Total classified</b></td><td class="num"><b>${s.classified}</b></td><td class="num">${s.classified ? "100.0%" : "0.0%"}</td><td class="num">${s.flagged_total - s.flagged_unclassified}</td></tr>`);
-    if (s.unclassified) rows.push(`<tr><td>Unclassified (excluded from %)</td><td class="num">${s.unclassified}</td><td class="num">-</td><td class="num">${s.flagged_unclassified}</td></tr>`);
-    const items = s.categories.map((x) => ({ label: x.category, value: x.count, color: colors[x.category] }));
-    pane.innerHTML = `<div class="table-wrap"><table><thead><tr><th>Category</th><th class="num">Count</th><th class="num">% of classified</th><th class="num">Flagged for inspection</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>
-      <div class="small muted" style="margin:8px 0 16px">Percentages are shares of classified grains. Unclassified grains are never assigned a category.</div>
-      ${s.classified ? `<div class="grid-2"><div><b>Grains per category</b>${barSvg(items)}</div><div><b>Share of classified grains</b>${donutSvg(items)}</div></div>` : `<div class="empty">No classified grains to chart.</div>`}
-      <div style="margin-top:16px"><b>Classified overview</b> <span class="small muted">(box colour = category, * after the ID = manual inspection)</span></div>
-      <div style="margin-top:8px">${imgBox(c.overview, "", true)}</div>${legend(colors)}`;
-  } else if (S.clsSub === 1) {
-    const cats = Object.keys(colors);
-    pane.innerHTML = `<div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
-      ${cats.map((k) => `<label class="check"><input type="checkbox" data-cat="${esc(k)}" ${S.clsShown.includes(k) ? "checked" : ""}><i style="width:10px;height:10px;border-radius:3px;background:${colors[k]};display:inline-block"></i>${esc(k)}</label>`).join("")}
-      <label class="check" style="margin-left:auto"><input type="checkbox" id="onlyFlag" ${S.clsOnlyFlag ? "checked" : ""}>Only manual inspection</label></div><div id="clsTable"></div>`;
-    $$("[data-cat]", pane).forEach((cb) => (cb.onchange = () => {
-      S.clsShown = $$("[data-cat]", pane).filter((x) => x.checked).map((x) => x.dataset.cat); drawClsTable();
-    }));
-    $("#onlyFlag").onchange = (e) => { S.clsOnlyFlag = e.target.checked; drawClsTable(); };
-    drawClsTable();
-  } else if (S.clsSub === 2) {
-    pane.innerHTML = `<h4>Observations</h4><ul class="tips" style="margin:8px 0 18px">${c.observations.map((o) => `<li>${esc(o)}</li>`).join("")}</ul>
-      <h4>Recommendations</h4><ul class="tips" style="margin-top:8px">${c.recommendations.map((o) => `<li>${esc(o)}</li>`).join("")}</ul>`;
-  } else {
-    pane.innerHTML = md(c.report);
-  }
+function matrixHtml() {
+  const files = S.files, cols = files.map((f) => ({ f, rows: predRows(f.sid) }));
+  const qs = cols.map((c) => (c.rows ? qualityTable(c.rows.map((r) => ({ category: r.label, confidence: r.confidence, length: r.length, width: r.width, area: r.area, review: r.confidence < S.set.thr }))) : null));
+  const cell = (x) => (x ? `${x.count} <span class="muted">(${x.pct.toFixed(1)}%)</span>` : `<span class="muted">…</span>`);
+  const tot = qs.reduce((a, q) => a + (q ? q.total.count : 0), 0);
+  const cats = S.cfg.classes;
+  return `${head("All images · grain types as parameters", "Count and share of each grain type for every uploaded photo.", `<button class="btn sm" id="qCsvAll">${dlIcon} All images (CSV)</button>`)}
+    <div class="table-wrap qwrap"><table class="qtable"><thead><tr><th>Parameter (grain type)</th>${files.map((f, i) => `<th class="num ${i === S.cur ? "curcol" : ""}" title="${esc(f.name)}">${esc(f.name.length > 18 ? f.name.slice(0, 17) + "…" : f.name)}</th>`).join("")}<th class="num">All images</th></tr></thead><tbody>
+    ${cats.map((c) => { const all = qs.reduce((a, q) => a + (q ? q.cats.find((x) => x.cat === c).count : 0), 0);
+      return `<tr><td class="pname"><i class="sw" style="background:${colorOf(c)}"></i><b>${esc(c)}</b></td>${qs.map((q) => `<td class="num">${cell(q && q.cats.find((x) => x.cat === c))}</td>`).join("")}<td class="num"><b>${all}</b> <span class="muted">(${tot ? ((all / tot) * 100).toFixed(1) : "0.0"}%)</span></td></tr>`; }).join("")}
+    <tr class="qtotal"><td class="pname"><b>Total graded</b></td>${qs.map((q) => `<td class="num"><b>${q ? q.total.count : "…"}</b></td>`).join("")}<td class="num"><b>${tot}</b></td></tr>
+    <tr class="qdef"><td class="pname"><b>Defective (all except Sound)</b></td>${qs.map((q) => `<td class="num">${q ? `${q.defective.count} <span class="muted">(${q.defective.pct.toFixed(1)}%)</span>` : "…"}</td>`).join("")}<td class="num">${(() => { const d = qs.reduce((a, q) => a + (q ? q.defective.count : 0), 0); return `${d} <span class="muted">(${tot ? ((d / tot) * 100).toFixed(1) : "0.0"}%)</span>`; })()}</td></tr>
+    </tbody></table></div>`;
 }
-function drawClsTable() {
-  const c = S.cls, colors = S.cfg.categories;
-  const rows = c.rows.filter((r) => S.clsShown.includes(r.category) || (r.category === "Unclassified" && S.clsShown.includes("Unclassified")))
-    .filter((r) => !S.clsOnlyFlag || r.manual_inspection === "Required");
-  $("#clsTable").innerHTML = `<div class="table-wrap"><table><thead><tr><th>ID</th><th>Category</th><th class="num">Confidence</th><th>Manual inspection</th><th>Why / notes</th><th>Model's visual reason</th>
-    <th class="num">Length</th><th class="num">Width</th><th class="num">Aspect</th><th class="num">Solidity</th><th class="num">Area</th></tr></thead><tbody>
-    ${rows.map((r) => `<tr><td class="num">${r.id}</td><td><span class="tag cat" style="background:${colors[r.category] || "#7f7f7f"}">${esc(r.category)}</span></td>
-      <td class="num">${r.confidence == null ? "-" : Math.round(r.confidence * 100) + "%"}</td>
-      <td><span class="tag ${r.manual_inspection === "Required" ? "Required" : "Normal"}">${esc(r.manual_inspection)}</span></td>
-      <td style="white-space:normal;min-width:220px">${esc(r.review_reasons)}</td><td style="white-space:normal;min-width:220px">${esc(r.model_reason)}</td>
-      <td class="num">${n1(r.length_px)}</td><td class="num">${n1(r.width_px)}</td><td class="num">${n2(r.aspect_ratio)}</td><td class="num">${n2(r.solidity)}</td><td class="num">${n0(r.area_px)}</td></tr>`).join("")}
-    </tbody></table></div><div class="small muted" style="margin-top:8px">Showing ${rows.length} of ${c.rows.length} grains. Confidence is reported by the model; it is not a calibrated probability. Measurements are in pixels.</div>`;
+function drawQGrainTable() {
+  const qd = qualityData(); if (!qd) return;
+  const rows = qd.rows.filter((r) => S.qShown.includes(r.category) && (!S.qOnlyReview || r.review));
+  $("#qGrainTable").innerHTML = `<div class="table-wrap"><table><thead><tr><th class="num">ID</th><th>Grain type</th><th class="num">Confidence</th><th>Manual inspection</th><th>Note</th><th class="num">Length (px)</th><th class="num">Width (px)</th><th class="num">Area (px²)</th></tr></thead><tbody>
+    ${rows.map((r) => `<tr><td class="num">${r.id}</td><td><span class="tag cat" style="background:${colorOf(r.category)}">${esc(r.category)}</span></td>
+      <td class="num">${r.confidence == null ? "-" : Math.round(r.confidence * 100) + "%"}</td><td><span class="tag ${r.review ? "Required" : "Normal"}">${r.review ? "Required" : "Not required"}</span></td>
+      <td style="white-space:normal;min-width:180px">${esc(r.reason)}</td><td class="num">${n1(r.length)}</td><td class="num">${n1(r.width)}</td><td class="num">${n0(r.area)}</td></tr>`).join("")}
+    </tbody></table></div><div class="small muted" style="margin-top:8px">Showing ${rows.length} of ${qd.rows.length} grains. Confidence is ${S.qsrc === "model" ? "the share of the model's decision trees that voted for the type; it is not a calibrated probability" : "reported by the Groq model; it is not a calibrated probability"}.</div>`;
 }
 function bindQuality() {
-  const b = $("#clsBtn");
-  if (b) b.onclick = runClassify;
-  $$("#clsTabs button").forEach((t) => (t.onclick = () => { S.clsSub = +t.dataset.i; $$("#clsTabs button").forEach((x) => x.classList.toggle("on", x === t)); drawClsPane(); }));
-  drawClsPane();
+  $$("#qSrc button").forEach((b) => (b.onclick = () => { S.qsrc = b.dataset.v; S.qShown = [...S.cfg.classes, "Unclassified"]; render(); }));
+  const gt = $("#goTrain"); if (gt) gt.onclick = () => setTab("train");
+  const cb = $("#clsBtn"); if (cb) cb.onclick = runClassify;
+  const qd = qualityData();
+  if (!qd) return;
+  $("#qCsv").onclick = qualityCsv;
+  $("#qCsv2").onclick = qualityGrainCsv;
+  const all = $("#qCsvAll");
+  if (all) all.onclick = () => {
+    const rows = [["Parameter (grain type)", ...S.files.map((f) => f.name + " (count)"), ...S.files.map((f) => f.name + " (%)")]];
+    const qs = S.files.map((f) => { const r = predRows(f.sid); return r ? qualityTable(r.map((x) => ({ category: x.label, confidence: x.confidence, length: x.length, width: x.width, area: x.area, review: false }))) : null; });
+    S.cfg.classes.forEach((c) => rows.push([c, ...qs.map((q) => (q ? q.cats.find((x) => x.cat === c).count : "")), ...qs.map((q) => (q ? +q.cats.find((x) => x.cat === c).pct.toFixed(1) : ""))]));
+    rows.push(["Total graded", ...qs.map((q) => (q ? q.total.count : "")), ...qs.map(() => "")]);
+    csvDownload("quality_all_images.csv", rows);
+  };
+  const byId = {}; qd.rows.forEach((r) => (byId[r.id] = r));
+  fillOverlay($("#qSvg"), (g) => { const r = byId[g.id]; const c = r ? colorOf(r.category) : "#7f7f7f";
+    return { color: c, fill: 0.18, dash: r && r.review, star: r && r.review, w: 2.5, tip: r ? `#${g.id} · ${r.category}${r.confidence != null ? " · " + Math.round(r.confidence * 100) + "%" : ""}${r.review ? " · needs review" : ""}` : `#${g.id}` }; }, null, true);
+  $$("[data-cat]").forEach((c) => (c.onchange = () => { S.qShown = $$("[data-cat]").filter((x) => x.checked).map((x) => x.dataset.cat); drawQGrainTable(); }));
+  $("#qOnlyRev").onchange = (e) => { S.qOnlyReview = e.target.checked; drawQGrainTable(); };
+  drawQGrainTable();
 }
+
+/* ======================================================================== */
+/*  Train: label grains yourself, train a model, test it on another photo     */
+/* ======================================================================== */
+const KEYS = (c) => S.cfg.classes.indexOf(c) + 1;
+const cropImgs = {};                                                     // sid -> Image (for the zoomed crop)
+function getCropImg(sid) {
+  let im = cropImgs[sid];
+  if (!im) {
+    im = cropImgs[sid] = new Image();
+    im.onload = () => { const g = S.sel && S.det ? grainById(S.sel) : null; if (g && S.tab === "train") drawCrop(g); };
+    im.src = S.originals[sid];
+  }
+  return im;
+}
+const grainById = (id) => S.det.grains.find((g) => g.id === id);
+
+function viewTrain() {
+  const tr = S.train, n = S.det.stats.count;
+  if (!tr || !tr.available) return callout("info", (tr && tr.reason) || "Training is unavailable in this installation.");
+  return `
+  <div class="card card-pad">${head("Train your own grain classifier", "Teach the dashboard what each grain type looks like on your photos. Everything stays on this computer: no API key, no internet.")}
+    <div class="mini-steps">
+      <div class="mini-step"><b class="n">1</b><div><b>Label a photo</b><div class="small muted">Click a grain, pick its type (or press 1 to 5). Do as many as you can, and a few of every type.</div></div></div>
+      <div class="mini-step"><b class="n">2</b><div><b>Add &amp; train</b><div class="small muted">Add the labels to your training set, then train. Your labels are saved, so you can upload a new photo afterwards.</div></div></div>
+      <div class="mini-step"><b class="n">3</b><div><b>Test on another photo</b><div class="small muted">Upload a different photo, press Predict, then give the true type of each grain to see the accuracy.</div></div></div>
+    </div>
+    <div id="trainTop"></div></div>
+  ${n ? "" : callout("warn", "No grains detected in this photo, so there is nothing to label. Adjust the detection settings (button at the top right) until every grain has a box.")}
+  <div class="grid-21 train-grid">
+    <div class="card card-pad">${head("Label grains", "Click a grain, then choose its type. Dashed boxes are model predictions, solid boxes are your labels.",
+      `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><label class="check"><input type="checkbox" id="tIds" ${S.showIds ? "checked" : ""}>Show IDs</label>
+       <div class="seg" id="tZoom">${[[1, "Fit"], [1.6, "160%"], [2.4, "240%"]].map(([z, l]) => `<button data-z="${z}" class="${S.zoom === z ? "on" : ""}">${l}</button>`).join("")}</div></div>`)}
+      ${stageShell("t", S.zoom)}
+      <div class="legend" id="tLegend"></div></div>
+    <div class="train-side"><div class="card card-pad" id="inspector"></div><div class="card card-pad" id="actions"></div></div>
+  </div>
+  <div id="trainAcc"></div>`;
+}
+
+/* ---- top status: training set + model ---- */
+function fillTrainTop() {
+  const tr = S.train, st = tr.store, m = tr.model, colors = S.cfg.colors;
+  const tiles = S.cfg.classes.map((c) => `<div class="cond" style="--c:${colors[c]}" title="${esc((S.cfg.class_defs || {})[c] || "")}"><div class="nm">${esc(c)}</div><div class="ct">${st.counts[c] || 0}</div><div class="pc">labelled grains</div></div>`).join("");
+  const classesWith = S.cfg.classes.filter((c) => (st.counts[c] || 0) > 0).length;
+  const thin = S.cfg.classes.filter((c) => (st.counts[c] || 0) > 0 && st.counts[c] < 5);
+  let model;
+  if (!m.trained) model = `<div class="callout info">No model yet. ${st.total ? "You have saved labels: press <b>Train model</b>." : "Label some grains and add them to the training set first."}</div>`;
+  else {
+    const cv = m.cv || {};
+    const stale = m.n_samples !== st.total;
+    model = `<div class="callout ok"><b>Model trained</b> ${esc(m.trained_at)} on ${m.n_samples} grains.
+      ${cv.accuracy != null ? `Quick self-check: <b>${Math.round(cv.accuracy * 100)}%</b> (${cv.folds}-fold cross-validation on your saved grains; optimistic, because grains from the same photo look alike. The real test is a different photo.)` : esc(cv.note || "")}
+      ${cv.accuracy != null && cv.note ? " " + esc(cv.note) : ""}</div>${stale ? `<div style="margin-top:8px">${callout("warn", "The training set changed since this model was trained. Press Train model again to include the changes.")}</div>` : ""}`;
+  }
+  $("#trainTop").innerHTML = `<div class="small muted" style="font-weight:700;margin-bottom:6px">TRAINING SET · ${st.total} grains from ${st.sources.length} photo${st.sources.length === 1 ? "" : "s"}</div>
+    <div class="cond-grid">${tiles}</div>
+    ${st.total && classesWith < 2 ? callout("warn", "Label at least two different grain types before training.") : ""}
+    <div class="small muted" style="margin:0 0 10px">Tip: small <b>Broken</b> fragments may be dropped by the detector's size filters. If they have no box, lower “Min size vs median” and the minimum grain area in Settings.</div>
+    ${thin.length ? `<div class="small muted" style="margin:0 0 10px">Few examples of ${thin.map(esc).join(", ")}. About 5 or more per type, ideally 20+, gives much more reliable results.</div>` : ""}
+    ${model}
+    ${st.sources.length ? `<details style="margin-top:12px"><summary class="small" style="cursor:pointer;font-weight:650">Photos in the training set (${st.sources.length})</summary>
+      <div class="table-wrap table-plain" style="margin-top:8px"><table><tbody>${st.sources.map((s) => `<tr><td>${esc(s.name)}</td><td class="num">${s.count} grains</td><td class="num"><button class="btn sm" data-rm="${esc(s.source)}">Remove</button></td></tr>`).join("")}</tbody></table></div>
+      <div style="margin-top:8px"><button class="btn sm" id="rmAll">Delete all training data and the model</button></div></details>` : ""}`;
+  $$("[data-rm]", $("#trainTop")).forEach((b) => (b.onclick = async () => {
+    try { S.train = await api("/api/train/delete", { source: b.dataset.rm }); toast("Removed from the training set.", true); refreshTrain(); } catch (e) { toast(e.message); }
+  }));
+  const ra = $("#rmAll");
+  if (ra) ra.onclick = async () => {
+    if (!confirm("Delete every saved training grain and the trained model? This cannot be undone.")) return;
+    try { S.train = await api("/api/train/delete", { all: true }); S.pred = {}; toast("Training data and model deleted.", true); refreshTrain(); } catch (e) { toast(e.message); }
+  };
+}
+
+/* ---- overlay on the photo ---- */
+function trainStyle(tm, pm) {
+  return (g) => {
+    const t = tm[g.id], p = pm[g.id];
+    if (t) return { color: colorOf(t), fill: 0.28, w: 2.5, tip: `#${g.id} · your label: ${t}${p ? ` · model: ${p.label} ${Math.round(p.confidence * 100)}%` : ""}` };
+    if (p) return { color: colorOf(p.label), fill: 0.1, dash: true, w: 2.5, tip: `#${g.id} · model: ${p.label} ${Math.round(p.confidence * 100)}% (not checked by you yet)` };
+    return { color: "#64748b", fill: 0.04, w: 1.8, tip: `#${g.id} · not labelled yet` };
+  };
+}
+function fillTrainLegend() {
+  $("#tLegend").innerHTML = S.cfg.classes.map((c) => `<span><i style="background:${colorOf(c)}"></i>${esc(c)}</span>`).join("") +
+    `<span><i style="background:#64748b"></i>Not labelled</span><span class="muted">Dashed = model prediction you have not confirmed</span>`;
+}
+
+/* ---- inspector (zoomed crop + label buttons) ---- */
+function fillInspector() {
+  const el = $("#inspector"), d = S.det, tm = truthMap(), pm = predMap(), g = S.sel ? grainById(S.sel) : null;
+  const total = d.grains.length, done = Object.keys(tm).length;
+  const progress = `<div class="small muted" style="display:flex;justify-content:space-between"><span>Your labels</span><span><b>${done}</b> of ${total} grains</span></div>
+    <div class="progress" style="margin:4px 0 12px"><div style="width:${total ? (done / total) * 100 : 0}%"></div></div>`;
+  if (!g) {
+    el.innerHTML = `${head("Grain inspector")}${progress}<div class="small muted" style="margin-bottom:12px">Click a grain on the photo to see it close up and label it.</div>
+      <button class="btn primary" data-act="start" ${total ? "" : "disabled"}>Start labelling →</button>`;
+    return;
+  }
+  const t = tm[g.id], p = pm[g.id];
+  const predLine = p ? `<div class="predline"><span>Model says</span> <span class="tag cat" style="background:${colorOf(p.label)}">${esc(p.label)}</span> <b>${Math.round(p.confidence * 100)}%</b>
+      ${t ? (t === p.label ? `<span class="tag Normal">matches you</span>` : `<span class="tag Large">differs from you</span>`) : ""}
+      <div class="small muted" style="margin-top:3px">${Object.entries(p.probs).slice(0, 3).map(([k, v]) => `${esc(k)} ${Math.round(v * 100)}%`).join(" · ")}</div></div>` : "";
+  el.innerHTML = `${head(`Grain #${g.id}`, `${n0(g.length)} × ${n0(g.width)} px · area ${n0(g.area)} px²`)}${progress}
+    <canvas id="cropCv" width="280" height="280"></canvas>
+    ${predLine}
+    <div class="small muted" style="margin:10px 0 6px">${t ? "Your label" : "Choose its type"} <span class="muted">(keys 1–5, 0 = clear)</span></div>
+    <div class="lblbtns">${S.cfg.classes.map((c) => `<button class="lbl ${t === c ? "on" : ""}" data-act="label" data-c="${esc(c)}" style="--c:${colorOf(c)}"><kbd>${KEYS(c)}</kbd>${esc(c)}</button>`).join("")}
+      <button class="lbl clear" data-act="label" data-c=""><kbd>0</kbd>Clear label</button></div>
+    <div class="navrow"><button class="btn sm" data-act="prev">◀ Prev</button><button class="btn sm" data-act="next">Next ▶</button><button class="btn sm" data-act="nextun">Next unlabelled</button></div>`;
+  const im = getCropImg(curFile().sid);
+  if (im.complete && im.naturalWidth) drawCrop(g);
+}
+function drawCrop(g) {
+  const cv = $("#cropCv"), im = cropImgs[curFile().sid];
+  if (!cv || !im || !im.naturalWidth || !S.sel || S.sel !== g.id) return;
+  const k = im.naturalWidth / S.det.width, [cx, cy] = gCenter(g);
+  const side = Math.max(g.box_w, g.box_h) * 1.9 + 16, ctx = cv.getContext("2d");
+  ctx.imageSmoothingQuality = "high";
+  ctx.fillStyle = "#e5e7eb"; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.drawImage(im, (cx - side / 2) * k, (cy - side / 2) * k, side * k, side * k, 0, 0, cv.width, cv.height);
+  const s = cv.width / side;                                              // outline of the grain's box
+  ctx.strokeStyle = "rgba(255,255,255,.9)"; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
+  ctx.strokeRect((g.x - (cx - side / 2)) * s - 2, (g.y - (cy - side / 2)) * s - 2, g.box_w * s + 4, g.box_h * s + 4);
+}
+
+/* ---- action buttons ---- */
+function fillActions() {
+  const tr = S.train, sid = curFile().sid, tm = truthMap(), nLab = Object.keys(tm).length, pm = predMap();
+  const showing = !!S.showPred[sid], busyT = S.trainBusy;
+  const canFit = tr.store.total >= 4 && Object.values(tr.store.counts).filter((c) => c > 0).length >= 2;
+  const unchecked = Object.keys(pm).filter((id) => !tm[id]).length;
+  $("#actions").innerHTML = `${head("Train & test")}
+    <div class="act-group"><div class="small muted"><b>This photo → training set</b></div>
+      <button class="btn primary" data-act="commit" ${!nLab || busyT ? "disabled" : ""}>Add ${nLab} labelled grain${nLab === 1 ? "" : "s"} to training set</button>
+      <button class="btn primary" data-act="fit" ${!canFit || busyT ? "disabled" : ""}>${busyT ? "Working…" : "Train model"}</button>
+      <div class="small muted">${S.dirty[sid] && nLab && !showing ? "You have labels not yet added. “Train model” adds them first." : "Adding a photo again replaces its earlier labels."}</div></div>
+    <div class="act-group"><div class="small muted"><b>Test the model on this photo</b></div>
+      ${showing ? `<button class="btn" data-act="hidepred">Hide predictions</button>` : `<button class="btn" data-act="predict" ${tr.model.trained && S.det.grains.length ? "" : "disabled"}>Predict this photo</button>`}
+      <button class="btn" data-act="accept" ${unchecked ? "" : "disabled"}>Accept ${unchecked} unchecked prediction${unchecked === 1 ? "" : "s"} as correct</button>
+      <div class="small muted">${tr.model.trained ? "For an honest score, label the photo first, then press Predict." : "Train a model first."}</div></div>
+    <div class="act-group"><button class="btn ghost sm" data-act="clearlabels" ${nLab ? "" : "disabled"}>Clear my labels on this photo</button></div>`;
+}
+
+/* ---- accuracy ---- */
+function fillAccuracy() {
+  const box = $("#trainAcc"), sid = curFile().sid;
+  if (!S.showPred[sid]) { box.innerHTML = ""; return; }
+  if (!modelTrained()) { box.innerHTML = ""; return; }
+  const pr = S.pred[sid];
+  if (!predRows()) { box.innerHTML = `<div class="card card-pad empty"><div class="spin" style="margin:0 auto 12px"></div>Predicting…</div>`; return; }
+  if (pr && pr.error) { box.innerHTML = callout("bad", pr.error); return; }
+  const tm = truthMap(), pm = predMap(), classes = S.cfg.classes;
+  const ids = Object.keys(tm).filter((id) => pm[id]);
+  if (!ids.length) {
+    box.innerHTML = `<div class="card card-pad">${head("Accuracy on this photo", "Waiting for your answers.")}
+      <div class="small muted">The model has graded ${Object.keys(pm).length} grains (dashed boxes). Click each grain and give its <b>true</b> type. The accuracy appears here and updates as you go.</div></div>`;
+    return;
+  }
+  const M = {}; classes.forEach((a) => { M[a] = {}; classes.forEach((b) => (M[a][b] = 0)); });
+  let ok = 0;
+  ids.forEach((id) => { const t = tm[id], p = pm[id].label; if (M[t] && p in M[t]) M[t][p]++; if (t === p) ok++; });
+  const n = ids.length, acc = (ok / n) * 100, left = Object.keys(pm).length - n;
+  const tone = acc >= 85 ? "var(--ok)" : acc >= 65 ? "var(--warn)" : "var(--bad)";
+  const per = classes.map((c) => {
+    const tN = classes.reduce((a, p) => a + M[c][p], 0), pN = classes.reduce((a, t) => a + M[t][c], 0), cor = M[c][c];
+    return `<tr><td class="pname"><i class="sw" style="background:${colorOf(c)}"></i><b>${esc(c)}</b></td><td class="num">${tN}</td><td class="num">${pN}</td><td class="num">${cor}</td>
+      <td class="num">${tN ? Math.round((cor / tN) * 100) + "%" : "-"}</td><td class="num">${pN ? Math.round((cor / pN) * 100) + "%" : "-"}</td></tr>`;
+  }).join("");
+  const mat = classes.map((t) => `<tr><td class="pname"><i class="sw" style="background:${colorOf(t)}"></i><b>${esc(t)}</b></td>${classes.map((p) => {
+    const v = M[t][p]; return `<td class="num ${v ? (t === p ? "mok" : "mbad") : ""}">${v || "·"}</td>`; }).join("")}</tr>`).join("");
+  box.innerHTML = `<div class="card card-pad">${head("Accuracy on this photo", `Model predictions compared with the true types you gave (${n} grains checked).`)}
+    <div class="acc-grid"><div class="acc-big" style="color:${tone}"><div class="v">${acc.toFixed(1)}%</div><div class="small muted">${ok} of ${n} correct</div>
+      ${left ? `<div class="small muted" style="margin-top:6px">${left} grain${left === 1 ? "" : "s"} not checked yet</div>` : `<div class="small muted" style="margin-top:6px">all predicted grains checked</div>`}
+      ${n < 20 ? `<div class="small" style="margin-top:8px;color:var(--warn)">Only ${n} grains: treat this score as rough.</div>` : ""}</div>
+      <div><div class="table-wrap table-plain"><table class="qtable"><thead><tr><th>Grain type</th><th class="num">True</th><th class="num">Predicted</th><th class="num">Correct</th><th class="num" title="Of the grains that really are this type, how many the model found">Recall</th><th class="num" title="Of the grains the model called this type, how many really are">Precision</th></tr></thead><tbody>${per}</tbody></table></div></div></div>
+    <div style="margin-top:16px"><b>Confusion matrix</b> <span class="small muted">rows = your label, columns = model prediction (green = correct)</span></div>
+    <div class="table-wrap table-plain" style="margin-top:8px"><table class="qtable"><thead><tr><th>True ↓ / Predicted →</th>${classes.map((c) => `<th class="num">${esc(c.length > 12 ? c.slice(0, 11) + "…" : c)}</th>`).join("")}</tr></thead><tbody>${mat}</tbody></table></div>
+    <div class="small muted" style="margin-top:10px">Wrong predictions? Add this photo's corrected labels to the training set, train again, then test on a new photo. The score of a photo you trained on is no longer a fair test.</div></div>`;
+}
+
+/* ---- redraw helpers ---- */
+function refreshOverlay() {
+  const svg = $("#tSvg"); if (!svg) return;
+  fillOverlay(svg, trainStyle(truthMap(), predMap()), S.sel, S.showIds);
+}
+function refreshTrain() {
+  if (S.tab !== "train" || !$("#tSvg")) return;
+  fillTrainTop(); fillTrainLegend(); refreshOverlay(); fillInspector(); fillActions(); fillAccuracy();
+}
+function refreshAfterLabel() { refreshOverlay(); fillInspector(); fillActions(); fillAccuracy(); }
+
+function ensureVisible(g) {
+  const wrap = $("#tWrap"), stage = $("#tStage"); if (!wrap || !stage) return;
+  const k = stage.clientWidth / S.det.width, pad = 40;
+  const x = g.x * k, y = g.y * k, w = g.box_w * k, h = g.box_h * k;
+  if (x < wrap.scrollLeft + pad) wrap.scrollLeft = x - pad; else if (x + w > wrap.scrollLeft + wrap.clientWidth - pad) wrap.scrollLeft = x + w - wrap.clientWidth + pad;
+  if (y < wrap.scrollTop + pad) wrap.scrollTop = y - pad; else if (y + h > wrap.scrollTop + wrap.clientHeight - pad) wrap.scrollTop = y + h - wrap.clientHeight + pad;
+}
+function selectGrain(id, scroll = false) {
+  S.sel = id; refreshOverlay(); fillInspector();
+  if (scroll) { const g = grainById(id); if (g) ensureVisible(g); }
+}
+function stepGrain(dir, onlyUnlabelled) {
+  const gs = S.det.grains; if (!gs.length) return;
+  const tm = truthMap();
+  let i = gs.findIndex((g) => g.id === S.sel);
+  for (let k = 0; k < gs.length; k++) {
+    i = (i + dir + gs.length) % gs.length;
+    if (!onlyUnlabelled || !tm[gs[i].id]) { selectGrain(gs[i].id, true); return; }
+  }
+  if (onlyUnlabelled) toast("Every grain on this photo has a label.", true);
+}
+function applyLabel(label) {
+  const g = S.sel ? grainById(S.sel) : null; if (!g) return;
+  setTruth(g, label);
+  refreshAfterLabel();
+  if (label) {                                                            // jump to the next grain without a label
+    const gs = S.det.grains, tm = truthMap();
+    const start = gs.findIndex((x) => x.id === g.id);
+    for (let k = 1; k <= gs.length; k++) { const nx = gs[(start + k) % gs.length]; if (!tm[nx.id]) { selectGrain(nx.id, true); return; } }
+  }
+}
+
+/* ---- actions that talk to the server ---- */
+async function commitLabels(silent = false) {
+  const tm = truthMap(), sid = curFile().sid;
+  if (!Object.keys(tm).length) return false;
+  S.trainBusy = true; fillActions();
+  try {
+    const r = await api("/api/train/commit", { sid, params: payload(), labels: tm });
+    S.train = r.state; S.dirty[sid] = false;
+    if (!silent) toast(`${r.saved} labelled grains added to the training set.`, true);
+    return true;
+  } catch (e) { toast(e.message); return false; }
+  finally { S.trainBusy = false; }
+}
+async function fitModel() {
+  const sid = curFile().sid;
+  S.trainBusy = true; fillActions(); busy(true);
+  try {
+    if (S.dirty[sid] && !S.showPred[sid] && Object.keys(truthMap()).length) await commitLabels(true);
+    S.train = await api("/api/train/fit", {});
+    S.pred = {};
+    const cv = S.train.model.cv || {};
+    toast(`Model trained on ${S.train.model.n_samples} grains${cv.accuracy != null ? ` (self-check ${Math.round(cv.accuracy * 100)}%)` : ""}. Now test it on another photo.`, true);
+  } catch (e) { toast(e.message); }
+  finally { S.trainBusy = false; busy(false); }
+  if (S.tab === "train") { refreshTrain(); autoPred(); }
+}
+async function onAction(act, el) {
+  const sid = curFile().sid;
+  if (act === "label") applyLabel(el.dataset.c);
+  else if (act === "prev") stepGrain(-1, false);
+  else if (act === "next") stepGrain(1, false);
+  else if (act === "nextun") stepGrain(1, true);
+  else if (act === "start") { const gs = S.det.grains, tm = truthMap(); const g = gs.find((x) => !tm[x.id]) || gs[0]; if (g) selectGrain(g.id, true); }
+  else if (act === "commit") { await commitLabels(); refreshTrain(); }
+  else if (act === "fit") await fitModel();
+  else if (act === "predict") { S.showPred[sid] = true; fillActions(); fillAccuracy(); await ensurePred([sid]); refreshTrain(); }
+  else if (act === "hidepred") { S.showPred[sid] = false; refreshTrain(); }
+  else if (act === "accept") {
+    const pm = predMap(), tm = truthMap();
+    S.det.grains.forEach((g) => { if (pm[g.id] && !tm[g.id]) setTruth(g, pm[g.id].label); });
+    refreshAfterLabel();
+  } else if (act === "clearlabels") {
+    if (!confirm("Remove all of your labels on this photo? (Labels already added to the training set are kept there.)")) return;
+    S.truth[sid] = []; S.dirty[sid] = false; S.sel = null; refreshTrain();
+  }
+}
+function bindTrain() {
+  if (!$("#tSvg")) return;
+  $("#tSvg").onclick = (e) => { const r = e.target.closest("[data-id]"); if (r) selectGrain(+r.dataset.id); };
+  const act = (e) => { const b = e.target.closest("[data-act]"); if (b && !b.disabled) onAction(b.dataset.act, b); };
+  $("#inspector").onclick = act; $("#actions").onclick = act;
+  $("#tIds").onchange = (e) => { S.showIds = e.target.checked; refreshOverlay(); };
+  $$("#tZoom button").forEach((b) => (b.onclick = () => { S.zoom = +b.dataset.z; $$("#tZoom button").forEach((x) => x.classList.toggle("on", x === b)); $("#tStage").style.width = S.zoom * 100 + "%"; }));
+  refreshTrain();
+}
+function trainKeys(e) {
+  if (S.tab !== "train" || !S.det || !$("#tSvg")) return;
+  if (e.target.closest("input, select, textarea") || e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = e.key;
+  if (/^[1-9]$/.test(k) && S.cfg.classes[+k - 1]) { if (S.sel) { e.preventDefault(); applyLabel(S.cfg.classes[+k - 1]); } }
+  else if (k === "0" || k === "Backspace" || k === "Delete") { if (S.sel) { e.preventDefault(); applyLabel(""); } }
+  else if (k === "ArrowRight") { e.preventDefault(); stepGrain(1, false); }
+  else if (k === "ArrowLeft") { e.preventDefault(); stepGrain(-1, false); }
+  else if (k === "n" || k === "N") { e.preventDefault(); stepGrain(1, true); }
+}
+
 async function runClassify() {
   const f = curFile();
   S.clsRunning = true; render();
@@ -588,14 +1056,22 @@ function dlBtn(label, kind, enabled = true) {
   return enabled ? `<a class="btn" href="${dlUrl(kind)}" download>${dlIcon} ${label}</a>` : `<span class="btn" style="opacity:.45;cursor:not-allowed">${dlIcon} ${label}</span>`;
 }
 function viewExport() {
-  const clsOk = S.cls && S.cls.state === "ok", aiOk = S.ai && S.ai.ok && S.aiKey === detKey();
+  const clsOk = S.cls && S.cls.state === "ok", aiOk = S.ai && S.ai.ok && S.aiKey === detKey(), qOk = !!qualityData();
   return `
   <div class="card card-pad">${head("Detection files")}<div class="dl-grid">
     ${dlBtn("Processed image (PNG)", "processed")}${dlBtn("Segmentation mask (PNG)", "mask")}${dlBtn("Grain data (CSV)", "csv")}</div></div>
-  <div class="card card-pad">${head("Classification results", clsOk ? "" : "Run “Classify grains with Groq” in the Quality tab to enable these downloads.")}<div class="dl-grid">
+  <div class="card card-pad">${head("Quality table", qOk ? "Grain types as parameters, for the current photo." : "Train a model (Train tab) or run the Groq classification (Quality tab) to enable these downloads.")}<div class="dl-grid">
+    ${qOk ? `<button class="btn" id="exQ1">${dlIcon} Quality table (CSV)</button><button class="btn" id="exQ2">${dlIcon} Per-grain quality (CSV)</button>` : `<span class="btn" style="opacity:.45;cursor:not-allowed">${dlIcon} Quality table (CSV)</span><span class="btn" style="opacity:.45;cursor:not-allowed">${dlIcon} Per-grain quality (CSV)</span>`}</div></div>
+  <div class="card card-pad">${head("Groq classification report", clsOk ? "" : "Run “Classify grains with Groq” in the Quality tab (Groq source) to enable these downloads.")}<div class="dl-grid">
     ${dlBtn("Classification report (PDF)", "pdf", clsOk)}${dlBtn("Per-grain results (CSV)", "cls_csv", clsOk)}${dlBtn("Category summary (CSV)", "cls_summary", clsOk)}</div></div>
   <div class="card card-pad">${head("AI report", aiOk ? "" : "Generate an AI report in the AI report tab to enable these downloads.")}<div class="dl-grid">
     ${dlBtn("Report (Markdown)", "md", aiOk)}${dlBtn("Report (Text)", "txt", aiOk)}</div></div>`;
+}
+
+function bindExport() {
+  const a = $("#exQ1"), b = $("#exQ2");
+  if (a) a.onclick = qualityCsv;
+  if (b) b.onclick = qualityGrainCsv;
 }
 
 /* ---- batch ---- */
@@ -647,14 +1123,15 @@ function render() {
   if (!S.files.length) { page.innerHTML = landing(); bindLanding(); return; }
   if (!S.det && S.tab !== "batch") { page.innerHTML = loadingView(); return; }
   const drop = `<div class="dropzone" id="dropzone"><span class="small muted">Drag more photos here to replace the current set, or</span><button class="btn sm" id="dzBtn">Choose photos</button><span class="small muted" style="margin-left:auto">${esc(curFile().name)} · ${curFile().width} × ${curFile().height}px</span></div>`;
-  const views = { overview: viewOverview, detection: viewDetection, quality: viewQuality, ai: viewAI, export: viewExport, batch: viewBatch };
+  const views = { overview: viewOverview, detection: viewDetection, train: viewTrain, quality: viewQuality, ai: viewAI, export: viewExport, batch: viewBatch };
   page.innerHTML = drop + views[S.tab]();
   $("#dzBtn").onclick = () => $("#fileInput").click();
-  const binds = { overview: bindOverview, detection: bindDetection, quality: bindQuality, batch: bindBatch };
+  const binds = { overview: bindOverview, detection: bindDetection, train: bindTrain, quality: bindQuality, export: bindExport, batch: bindBatch };
   if (binds[S.tab]) binds[S.tab]();
   if (S.tab === "ai" && $("#aiBtn")) $("#aiBtn").onclick = runAI;
   $$(".zoomable img", page).forEach((im) => (im.onclick = () => zoom(im.src)));
   if (S.tab === "batch") loadBatch();
+  autoPred();
 }
 function bindLanding() {
   const b = $("#heroBtn");
@@ -671,7 +1148,7 @@ async function setTab(t) {
   S.tab = t;
   $("#sidebar").classList.remove("open");
   render();
-  if (S.det && ["overview", "quality", "export"].includes(t)) { await refreshCls(true); render(); }
+  if (S.det && ["overview", "quality", "export"].includes(t)) { await refreshCls(true); if (S.tab === t) render(); }
 }
 
 /* ------------------------------------------------------------------- init */
@@ -693,6 +1170,8 @@ async function init() {
   $("#groqDot").className = "dot " + (S.cfg.groq ? "ok" : "off");
   $("#groqText").textContent = S.cfg.groq ? "Groq connected" : "Groq key not set (optional)";
   $("#modelText").textContent = S.cfg.groq ? S.cfg.model : "";
+  S.train = S.cfg.train;
+  S.qShown = [...S.cfg.classes, "Unclassified"];
   resetSettings(); buildSettings(); syncControls();
 
   $$(".nav-btn").forEach((b) => (b.onclick = () => setTab(b.dataset.tab)));
@@ -702,6 +1181,7 @@ async function init() {
   $("#resetBtn").onclick = () => { resetSettings(); runDetect(); if (S.tab === "quality") refreshCls(); };
   $("#settingsToggle").onclick = () => $("#settings").classList.toggle("open");
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("#settings").classList.remove("open"); });
+  document.addEventListener("keydown", trainKeys);
   $("#settingsClose").onclick = () => $("#settings").classList.remove("open");
   $("#menuBtn").onclick = () => $("#sidebar").classList.toggle("open");
 

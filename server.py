@@ -35,6 +35,10 @@ try:
     import grain_report as gr
 except Exception:
     gr = None
+try:                       # your own trainable classifier (needs scikit-learn)
+    import grain_trainer as gt
+except Exception:
+    gt = None
 
 BASE = Path(__file__).resolve().parent
 ACCEPTED = {"png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp"}
@@ -46,6 +50,8 @@ app.json.sort_keys = False                                    # keep preset / ca
 
 SESSIONS: "OrderedDict[str, dict]" = OrderedDict()
 LOCK = threading.Lock()
+STORE = gt.TrainingStore() if gt else None          # labelled grains saved on disk
+MODEL = gt.GrainModel() if gt else None             # the trained classifier
 
 
 # =========================================================================== #
@@ -173,6 +179,11 @@ def _key_error(e):
     return err(str(e.args[0]) if e.args else "Not found", 404)
 
 
+@app.errorhandler(ValueError)
+def _value_error(e):                                  # friendly, expected problems (not enough labels, ...)
+    return err(str(e), 400)
+
+
 @app.errorhandler(Exception)
 def _any_error(e):
     if hasattr(e, "code") and isinstance(e.code, int):          # werkzeug HTTP errors
@@ -203,6 +214,9 @@ def status():
                      "rel": defaults.rel_min_pct, "split": defaults.split, "level": defaults.split_level},
         "categories": gr.CATEGORY_COLORS if gr else {},
         "category_defs": gr.CATEGORY_DEFINITIONS if gr else {},
+        "classes": gt.CLASSES if gt else [], "colors": gt.COLORS if gt else {},
+        "class_defs": gt.DEFINITIONS if gt else {},
+        "train": train_state(),
     })
 
 
@@ -396,6 +410,116 @@ def api_ai():
                       "error": f"AI analysis failed: {type(e).__name__}", "hint": ""}
     a = sess["ai"]
     return jsonify({"ok": a["ok"], "error": a["error"], "hint": a["hint"], "report": a["report"]})
+
+
+# =========================================================================== #
+# Train your own classifier (local, scikit-learn)
+# =========================================================================== #
+def train_state() -> dict:
+    if gt is None:
+        return {"available": False, "reason": "scikit-learn is not installed. Run: pip install scikit-learn",
+                "model": {"trained": False, "version": None}, "store": {"total": 0, "counts": {}, "sources": []}}
+    return {"available": True, "model": MODEL.info(), "store": STORE.summary()}
+
+
+def _need_trainer():
+    if gt is None:
+        raise ValueError("Training needs scikit-learn. Run:  pip install scikit-learn   then restart the server.")
+
+
+def _source_key(sess: dict) -> str:
+    return f"{sess['name']}|{sess['size']}"
+
+
+def _detect_light(sess: dict, params: Params, ids: bool, tilted: bool):
+    """Detection for this image + settings, reusing the cached result when it matches (no annotation)."""
+    cached = sess.get("det")
+    if cached and cached["key"] == f"{params!r}|{ids}|{tilted}":
+        return cached["original"], cached["res"].grains, cached["scale"]
+    original = sess.get("orig")
+    if original is None:
+        original = sess["orig"] = load_image(sess["data"])
+    work, scale = resize_for_processing(original)
+    return original, detect(work, params).grains, scale
+
+
+def _features(sess: dict, params: Params, ids: bool, tilted: bool):
+    """Feature matrix for the grains of this image (cached per image + detection settings)."""
+    key = repr(params)
+    f = sess.get("feat")
+    if f and f["key"] == key:
+        return f["X"], f["grains"], f["scale"]
+    original, grains, scale = _detect_light(sess, params, ids, tilted)
+    X = gt.extract_features(original, grains, scale)
+    sess["feat"] = {"key": key, "X": X, "grains": grains, "scale": scale}
+    return X, grains, scale
+
+
+@app.get("/api/train/state")
+def api_train_state():
+    return jsonify(train_state())
+
+
+@app.post("/api/train/commit")
+def api_train_commit():
+    """Save the labels you gave one image to the training set (replaces earlier labels of that image)."""
+    _need_trainer()
+    body = request.get_json(force=True)
+    sess = get_session(body["sid"])
+    params, ids, tilted = parse_params(body.get("params"))
+    labels = body.get("labels") or {}
+    X, grains, scale = _features(sess, params, ids, tilted)
+    gids, labs = [], []
+    for k, v in labels.items():
+        i = int(k)
+        if v in gt.CLASSES and 1 <= i <= len(grains):
+            gids.append(i); labs.append(v)
+    if not gids:
+        return err("Label at least one grain first (click a grain, then choose its type).")
+    STORE.add_image(_source_key(sess), sess["name"], gids, labs, X[[i - 1 for i in gids]])
+    return jsonify({"saved": len(gids), "state": train_state()})
+
+
+@app.post("/api/train/fit")
+def api_train_fit():
+    _need_trainer()
+    X, y = STORE.matrix()
+    MODEL.fit(X, y)
+    return jsonify(train_state())
+
+
+@app.post("/api/train/predict")
+def api_train_predict():
+    """Grade the grains of one or more images with your trained model."""
+    _need_trainer()
+    if not MODEL.trained:
+        return err("Train a model first (Train tab).")
+    body = request.get_json(force=True)
+    params, ids, tilted = parse_params(body.get("params"))
+    out = {}
+    for sid in body.get("sids", []):
+        try:
+            sess = get_session(sid)
+            X, grains, scale = _features(sess, params, ids, tilted)
+            preds = MODEL.predict(X)
+            rows = grain_rows(grains, scale)
+            for r, p in zip(rows, preds):
+                r.update(label=p["label"], confidence=round(p["confidence"], 3), probs=p["probs"])
+            out[sid] = {"name": sess["name"], "rows": rows}
+        except KeyError as e:
+            out[sid] = {"name": sid, "rows": [], "error": str(e.args[0])}
+    return jsonify({"version": MODEL.meta.get("version"), "results": out})
+
+
+@app.post("/api/train/delete")
+def api_train_delete():
+    _need_trainer()
+    body = request.get_json(force=True)
+    if body.get("all"):
+        STORE.clear(); MODEL.reset()
+    elif body.get("source"):
+        STORE.remove_source(body["source"])
+    return jsonify(train_state())
 
 
 # =========================================================================== #
