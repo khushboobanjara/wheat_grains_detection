@@ -3,8 +3,10 @@
 A professional web dashboard (plain **HTML + CSS + JavaScript**, served by a small **Flask** backend) that
 **detects, counts, measures and (optionally) grades wheat grains** from a photo. Detection is classical
 computer vision (HSV segmentation, morphology, contours, watershed, shape filters) and runs 100 % locally with
-OpenCV: no dataset, no training, no paid service. Grain classification and the written report are **optional**
-and use the free Groq Vision API only when you add a key and click the button.
+OpenCV: no dataset and no paid service needed. Grain **quality grading** (Sound / Shrivelled / Immature / Broken /
+Damaged-Discoloured) uses a model you **train once in the terminal** (`python train.py`); the dashboard then only
+**predicts** new photos with it. The Groq classification and written report are **optional** and use the free Groq
+Vision API only when you add a key and click the button.
 
 > This version replaces the earlier Streamlit front end. The detection and Groq modules are unchanged.
 
@@ -20,12 +22,14 @@ python server.py               # open http://localhost:8000
 ```
 Use another port with `PORT=9000 python server.py` (Windows: `set PORT=9000`).
 
+**Workflow:** 1) sort photos into folders  2) `python train.py` (terminal)  3) `python server.py`, open **Predict**, upload a new photo.
+
 ## Dashboard tour
 | View | What you get |
 |---|---|
 | **Overview** | KPI cards (grain count, average size, size variation, processing time), view switcher (side-by-side / processed / original / mask), size-distribution histogram, summary statistics |
 | **Detection** | Segmentation mask, active settings, sortable per-grain table with small/large outlier flag |
-| **Train** | Label grains yourself (click + keys 1-5), train your own classifier, predict another photo and see its accuracy + confusion matrix |
+| **Predict** | Shows the model you trained in the terminal (date, grains, test accuracy, per-type scores, confusion matrix) and grades the uploaded photo grain by grain, with a close-up and the model's confidence per type |
 | **Quality** | Full report table with the grain types (Sound / Shrivelled / Immature / Broken / Damaged-Discoloured) as rows: count, % by count, % by area, average size, confidence, review flags. Source: your trained model, or optional Groq |
 | **AI report** | *(optional, Groq)* Written visual analysis of colour, shape, uniformity and defects |
 | **Export** | Processed PNG, mask PNG, grain CSV, classification PDF + CSVs, AI report (MD/TXT) |
@@ -35,11 +39,39 @@ The right-hand **Detection settings** panel holds the colour preset, HSV range, 
 touching-grain splitting and display options, plus **Reset all settings**. Results update live as you move a slider.
 Other touches: drag-and-drop upload, click-to-enlarge images, light/dark theme, responsive layout.
 
-## Train your own model (no API key)
-1. Upload photo 1, open **Train**, click each grain and choose its type (or press 1-5). Keys: `0` clear, arrows / `N` move.
-2. **Add labelled grains to training set**, then **Train model**. Labels are saved in `training_data/`, the model in `models/`.
-3. Upload a different photo, press **Predict this photo**, then give the true type of the grains: accuracy, per-type recall/precision and a confusion matrix appear. Corrected photos can be added to the training set to improve the model.
-The **Quality** tab then fills the report table automatically for every photo. Needs `scikit-learn` (in requirements.txt).
+## Train your own model in the terminal (no API key)
+Training happens **outside the browser**. The dashboard never trains; it loads `models/grain_model.joblib` and predicts.
+
+**1. Put your photos in one folder per grain type.** Each photo should show grains of **one** type only:
+```
+dataset/
+  Sound/                 photo1.jpg  photo2.jpg ...
+  Shrivelled/
+  Immature/
+  Broken/
+  Damaged_Discoloured/
+```
+`python train.py --make-folders` creates the empty folders. Folder names are matched loosely (case, `_`, `-`, "Shriveled" all work). Use several photos per type, ideally 5+ and 100+ grains per type, taken at the **same distance and in similar light**.
+
+**2. Train.**
+```bash
+python train.py
+```
+It detects the grains with OpenCV, builds the features, trains a Random Forest and prints a report: accuracy, per-type precision / recall, confusion matrix. Accuracy is measured on photos the model did **not** train on (photo-level cross-validation), because grains from the same photo look alike and would give a flattering score. Saved to `models/grain_model.joblib` and `models/training_report.txt`.
+
+**3. Predict.** `python server.py` → **Predict** tab → upload any new photo. The **Quality** tab then fills in the grain-type table automatically. After re-training, the server picks up the new model by itself (or press *Reload model*).
+
+Useful options:
+| Command | Purpose |
+|---|---|
+| `python train.py --test-dir dataset_test` | Score the model on separate photos (same folder layout) instead of cross-validation: the most honest number for your report |
+| `python train.py --data my_photos` | Use another dataset folder |
+| `python train.py --preset "Pale / light wheat"` | Detection colour preset (also `--min-area`, `--max-area`, `--rel-min-pct`, `--no-split`) |
+| `python train.py --normalize photo` | For photos that mix good and bad grains: judge sizes against each photo's own median grain instead of a fixed reference |
+| `python train.py --from-samples` | Re-use grains you labelled earlier with the old in-browser trainer (`training_data/samples.json`) |
+| `python train.py --trees 500 --seed 1` | Random Forest size / reproducibility |
+
+Check that every photo reports a sensible grain count while training (a photo with `NO GRAINS FOUND` needs different detection settings). Broken fragments can be filtered out by the default shape filters; if that happens try `--rel-min-pct 0` and a smaller `--min-area`.
 
 ## Optional: Groq key
 1. Create a free key at https://console.groq.com/keys
@@ -62,16 +94,17 @@ you click *Classify grains with Groq* or *Generate AI report*. Never share or co
 ## Files
 | File | Purpose |
 |---|---|
-| `server.py` | Flask backend: upload, detection, batch, Groq endpoints, downloads |
+| `server.py` | Flask backend: upload, detection, batch, model prediction, Groq endpoints, downloads |
 | `static/index.html` | Page shell (sidebar, top bar, settings panel) |
 | `static/style.css` | Design system, light/dark themes, responsive rules |
 | `static/app.js` | Dashboard logic, charts (inline SVG), tables, API calls. No external libraries |
 | `wheat_detector.py` | Detection pipeline (unchanged) |
-| `grain_trainer.py` | Feature extraction, training-set store, Random Forest model |
+| `train.py` | **Terminal training**: reads `dataset/`, evaluates, saves the model |
+| `grain_trainer.py` | Feature extraction + model wrapper (load / predict) used by `train.py` and `server.py` |
 | `groq_analyzer.py`, `grain_report.py` | Optional Groq classification, report, PDF/CSV (unchanged) |
 
 ## Limitations
 Colour-based detection depends on lighting and background. Heavily stacked grains, strong colour casts or a
 background the same colour as the wheat need manual slider tuning. Measurements are in pixels (no physical
-calibration). Groq confidence values are the model's own estimate, not a measured accuracy. Uploaded images are
+calibration). The trained model's confidence is the share of decision trees that voted for a type, not a calibrated probability, and it only knows what your training photos showed (other camera, lighting or wheat variety → re-train). Groq confidence values are the model's own estimate, not a measured accuracy. Uploaded images are
 kept in server memory only (the 40 most recent) and are lost when the server restarts.

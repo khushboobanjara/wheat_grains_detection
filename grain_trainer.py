@@ -1,32 +1,40 @@
 """
-Train your own grain-quality classifier (runs 100 % locally, no API key, no internet).
+Grain-quality classifier: feature extraction + model wrapper (runs 100 % locally, no API key).
 
-Workflow
---------
-1. Upload a photo; OpenCV detects the grains (wheat_detector.py).
-2. You label grains one by one (Sound / Shrivelled / Immature / Broken / Damaged/Discoloured).
-3. ``TrainingStore.add_image`` turns every labelled grain into a feature vector and saves it.
-4. ``fit`` trains a Random Forest on everything saved so far.
-5. ``predict`` grades the grains of any other photo; the browser compares the predictions with
-   the labels you give that photo to report the real accuracy.
+How the pieces fit together
+---------------------------
+    train.py   (terminal)   photos sorted into one folder per grain type
+                            -> OpenCV finds the grains -> features -> Random Forest
+                            -> models/grain_model.joblib   (+ held-out evaluation)
+    server.py  (dashboard)  loads that file and only PREDICTS the grains of uploaded photos.
 
-Features (per grain, all rotation-invariant and scale-free where possible)
--------------------------------------------------------------------------
-* shape  : aspect ratio, solidity, extent, circularity, length / width / area relative to the
-           median grain of the SAME photo (so a fragment looks small whatever the zoom is)
-* colour : mean + spread of H, S, V and L*a*b* inside the grain outline, plus how far each
-           mean is from the photo's median grain (cancels most lighting differences)
+Nothing is trained inside the browser any more.
+
+Features (per grain)
+--------------------
+* shape  : aspect ratio, solidity, extent, circularity, length / width / area relative to a REFERENCE grain
+* colour : mean + spread of H, S, V and L*a*b* inside the grain outline, plus offset from the reference colour
 * defect : share of unusually dark / pale / off-hue pixels (rot, stains, chalky or green grain)
 * texture: grey-level spread, Laplacian roughness and edge density (wrinkles, cracks, holes)
 
-Files written next to this module (git-ignored):
-    training_data/samples.json   labelled grains (features only, no images)
-    models/grain_model.joblib    the trained model
+Reference grain
+---------------
+"Relative" features need a yardstick:
+
+* ``normalize = "reference"`` (default when training from sorted folders): a fixed reference (median Sound
+  grain of the training photos) is stored inside the model and reused for every prediction. Needed because a
+  photo that contains ONLY broken grains has no "normal" grain to compare against.
+  -> take all photos with the same camera distance / lighting.
+* ``normalize = "photo"``: the median grain of each photo is the yardstick (needs photos that mix good and bad
+  grains, e.g. the legacy labels in training_data/samples.json).
+
+The mode and the reference are saved in the model file, so the dashboard always applies the same one.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import threading
 from collections import Counter
 from datetime import datetime
@@ -39,7 +47,7 @@ import numpy as np
 BASE = Path(__file__).resolve().parent
 DATA_DIR = BASE / "training_data"
 MODEL_DIR = BASE / "models"
-SAMPLES_FILE = DATA_DIR / "samples.json"
+LEGACY_SAMPLES = DATA_DIR / "samples.json"          # labelled grains saved by the old in-browser trainer
 MODEL_FILE = MODEL_DIR / "grain_model.joblib"
 
 # Same names / colours as grain_report.py so both sources look identical in the dashboard.
@@ -59,6 +67,11 @@ DEFINITIONS = {
     "Broken": "Fragmented, cracked, chipped or with a visibly missing part.",
     "Damaged/Discoloured": "Insect holes, sprouting, mould-like patches, heat/weather damage or stained colour.",
 }
+# Folder names are matched loosely (case, spaces, "_" and "-" are ignored; British/US spelling both work).
+FOLDER_ALIASES = [("sound", "Sound"), ("shriv", "Shrivelled"), ("shrunk", "Shrivelled"), ("immat", "Immature"),
+                  ("broken", "Broken"), ("damag", "Damaged/Discoloured"), ("discolo", "Damaged/Discoloured")]
+FOLDER_NAMES = {"Sound": "Sound", "Shrivelled": "Shrivelled", "Immature": "Immature", "Broken": "Broken",
+                "Damaged/Discoloured": "Damaged_Discoloured"}      # what `train.py --make-folders` creates
 
 MIN_SAMPLES = 4          # smallest training set we accept
 MIN_CLASSES = 2          # a classifier needs at least two different labels
@@ -69,13 +82,22 @@ FEATURE_NAMES = [
     "aspect", "solidity", "extent", "circularity", "rel_length", "rel_width", "rel_area",
     # colour (absolute)
     "h_mean", "s_mean", "v_mean", "L_mean", "a_mean", "b_mean", "h_std", "s_std", "v_std",
-    # colour (relative to the photo's median grain)
+    # colour (relative to the reference grain)
     "d_h", "d_s", "d_v", "d_L", "d_a", "d_b",
     # defect fractions
     "dark_frac", "pale_frac", "offhue_frac",
     # texture
     "gray_std", "lap_mean", "edge_density",
 ]
+
+
+def class_from_folder(name: str) -> Optional[str]:
+    """'Damaged_Discoloured' / 'damaged-discoloured' / 'Shriveled' ... -> canonical class name (or None)."""
+    key = re.sub(r"[^a-z]", "", name.lower())
+    for prefix, cls in FOLDER_ALIASES:
+        if key.startswith(prefix):
+            return cls
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -97,17 +119,11 @@ def _patch(orig: np.ndarray, contour_work: np.ndarray, scale: float, pad: int = 
     return crop, mask
 
 
-def extract_features(orig_bgr: np.ndarray, grains: Sequence, scale: float) -> np.ndarray:
-    """Feature matrix (n_grains x len(FEATURE_NAMES)) for the grains found in ONE photo."""
-    n = len(grains)
-    if n == 0:
-        return np.zeros((0, len(FEATURE_NAMES)))
-
+def collect(orig_bgr: np.ndarray, grains: Sequence, scale: float) -> dict:
+    """Raw per-grain measurements of ONE photo (no reference needed yet)."""
     lengths = np.array([max(g.rect[1]) * scale for g in grains], float)
     widths = np.array([min(g.rect[1]) * scale for g in grains], float)
     areas = np.array([g.area * scale * scale for g in grains], float)
-    med_l, med_w, med_a = (max(float(np.median(v)), 1e-6) for v in (lengths, widths, areas))
-
     stats, patches = [], []
     for g in grains:
         crop, mask = _patch(orig_bgr, g.contour, scale)
@@ -119,9 +135,35 @@ def extract_features(orig_bgr: np.ndarray, grains: Sequence, scale: float) -> np
         hsv_px, lab_px = hsv[sel], lab[sel]
         stats.append((hsv_px.mean(0), lab_px.mean(0), hsv_px.std(0)))
         patches.append((crop, sel, hsv_px))
+    return {"lengths": lengths, "widths": widths, "areas": areas, "stats": stats, "patches": patches}
 
-    hsv_med = np.median([s[0] for s in stats], axis=0)
-    lab_med = np.median([s[1] for s in stats], axis=0)
+
+def photo_reference(raw: dict) -> dict:
+    """The median grain of one photo (JSON-friendly)."""
+    return {"length": max(float(np.median(raw["lengths"])), 1e-6),
+            "width": max(float(np.median(raw["widths"])), 1e-6),
+            "area": max(float(np.median(raw["areas"])), 1e-6),
+            "hsv": np.median([s[0] for s in raw["stats"]], axis=0).tolist(),
+            "lab": np.median([s[1] for s in raw["stats"]], axis=0).tolist()}
+
+
+def merge_references(refs: List[dict]) -> dict:
+    """One reference out of several photos (median of the per-photo medians)."""
+    return {"length": float(np.median([r["length"] for r in refs])),
+            "width": float(np.median([r["width"] for r in refs])),
+            "area": float(np.median([r["area"] for r in refs])),
+            "hsv": np.median([r["hsv"] for r in refs], axis=0).tolist(),
+            "lab": np.median([r["lab"] for r in refs], axis=0).tolist()}
+
+
+def features_from(raw: dict, grains: Sequence, scale: float, ref: dict) -> np.ndarray:
+    """Feature matrix (n_grains x len(FEATURE_NAMES)) measured against the reference grain `ref`."""
+    n = len(grains)
+    if n == 0:
+        return np.zeros((0, len(FEATURE_NAMES)))
+    lengths, widths, areas, stats, patches = (raw[k] for k in ("lengths", "widths", "areas", "stats", "patches"))
+    med_l, med_w, med_a = ref["length"], ref["width"], ref["area"]
+    hsv_med, lab_med = np.array(ref["hsv"], float), np.array(ref["lab"], float)
 
     rows = []
     for i, g in enumerate(grains):
@@ -150,169 +192,122 @@ def extract_features(orig_bgr: np.ndarray, grains: Sequence, scale: float) -> np
     return np.nan_to_num(np.array(rows, float), nan=0.0, posinf=0.0, neginf=0.0)
 
 
-# --------------------------------------------------------------------------- #
-# Training-set store (JSON on disk)
-# --------------------------------------------------------------------------- #
-class TrainingStore:
-    """Labelled grains collected from one or more photos, persisted in training_data/samples.json."""
+def extract_features(orig_bgr: np.ndarray, grains: Sequence, scale: float, ref: Optional[dict] = None) -> np.ndarray:
+    """Features for the grains of one photo. ``ref`` = the model's stored reference; None = this photo's median."""
+    if len(grains) == 0:
+        return np.zeros((0, len(FEATURE_NAMES)))
+    raw = collect(orig_bgr, grains, scale)
+    return features_from(raw, grains, scale, ref if ref else photo_reference(raw))
 
-    def __init__(self, path: Path = SAMPLES_FILE):
-        self.path = path
-        self.lock = threading.RLock()
-        self.samples: List[dict] = []
-        self._load()
 
-    def _load(self):
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            if data.get("feature_version") == FEATURE_VERSION and data.get("feature_names") == FEATURE_NAMES:
-                self.samples = [s for s in data.get("samples", []) if s.get("label") in CLASSES]
-        except Exception:
-            self.samples = []
-
-    def _save(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"feature_version": FEATURE_VERSION, "feature_names": FEATURE_NAMES,
-                                   "saved": datetime.now().isoformat(timespec="seconds"),
-                                   "samples": self.samples}), encoding="utf-8")
-        tmp.replace(self.path)
-
-    def add_image(self, source: str, name: str, ids: List[int], labels: List[str], feats: np.ndarray):
-        """Store the labelled grains of one photo. Earlier labels from the same photo are replaced."""
-        with self.lock:
-            self.samples = [s for s in self.samples if s["source"] != source]
-            for gid, lab, f in zip(ids, labels, feats):
-                self.samples.append({"source": source, "name": name, "id": int(gid), "label": lab,
-                                     "x": [round(float(v), 5) for v in f]})
-            self._save()
-
-    def remove_source(self, source: str):
-        with self.lock:
-            self.samples = [s for s in self.samples if s["source"] != source]
-            self._save()
-
-    def clear(self):
-        with self.lock:
-            self.samples = []
-            self._save()
-
-    def matrix(self):
-        with self.lock:
-            X = np.array([s["x"] for s in self.samples], float) if self.samples else np.zeros((0, len(FEATURE_NAMES)))
-            y = [s["label"] for s in self.samples]
-        return X, y
-
-    def summary(self) -> dict:
-        with self.lock:
-            counts = Counter(s["label"] for s in self.samples)
-            srcs: Dict[str, dict] = {}
-            for s in self.samples:
-                d = srcs.setdefault(s["source"], {"source": s["source"], "name": s["name"], "count": 0})
-                d["count"] += 1
-            return {"total": len(self.samples), "counts": {c: counts.get(c, 0) for c in CLASSES},
-                    "sources": list(srcs.values())}
+def load_legacy_samples(path: Path = LEGACY_SAMPLES):
+    """Labelled grains saved by the old in-browser trainer (photo-normalised features). Returns (X, y, source_per_grain)."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if data.get("feature_names") != FEATURE_NAMES:
+        raise ValueError(f"{path} was written with different features and cannot be used.")
+    samples = [s for s in data.get("samples", []) if s.get("label") in CLASSES]
+    X = np.array([s["x"] for s in samples], float) if samples else np.zeros((0, len(FEATURE_NAMES)))
+    return X, [s["label"] for s in samples], [s["source"] for s in samples]
 
 
 # --------------------------------------------------------------------------- #
 # Model
 # --------------------------------------------------------------------------- #
+def make_classifier(trees: int = 300, seed: int = 0):
+    from sklearn.ensemble import RandomForestClassifier
+    return RandomForestClassifier(n_estimators=trees, class_weight="balanced_subsample",
+                                  min_samples_leaf=1, random_state=seed, n_jobs=-1)
+
+
 class GrainModel:
-    """Random Forest wrapper: fit(), predict(), and cached metadata for the dashboard."""
+    """Loads a model trained by train.py. The dashboard only calls load() / predict() / info()."""
 
     def __init__(self, path: Path = MODEL_FILE):
-        self.path = path
+        self.path = Path(path)
         self.lock = threading.RLock()
         self.clf = None
         self.meta: dict = {}
-        self._load()
+        self.error = ""
+        self._stamp = None                 # (mtime, size) of the model file when it was last loaded
+        self.load()
 
     # -- persistence --------------------------------------------------------
-    def _load(self):
-        try:
-            import joblib
-            if self.path.is_file():
+    def load(self) -> bool:
+        """(Re)load the model file. Safe to call while the server is running (e.g. after re-training)."""
+        clf, meta, error = None, {}, ""
+        if self.path.is_file():
+            try:
+                import joblib
                 blob = joblib.load(self.path)
                 if blob.get("feature_names") == FEATURE_NAMES:
-                    self.clf, self.meta = blob["clf"], blob["meta"]
-        except Exception:
-            self.clf, self.meta = None, {}
+                    clf, meta = blob["clf"], blob["meta"]
+                else:
+                    error = "The saved model uses a different feature set. Train it again with: python train.py"
+            except Exception as e:
+                error = f"The model file could not be read ({type(e).__name__}). Train it again with: python train.py"
+        with self.lock:
+            self.clf, self.meta, self.error, self._stamp = clf, meta, error, self._file_stamp()
+        return clf is not None
 
-    def _save(self):
+    def _file_stamp(self):
+        try:
+            st = self.path.stat()
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def reload_if_changed(self) -> bool:
+        """Re-read the model file when train.py has replaced (or removed) it since the last load."""
+        if self._file_stamp() != self._stamp:
+            self.load()
+            return True
+        return False
+
+    def save(self):
         import joblib
         self.path.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump({"clf": self.clf, "meta": self.meta, "feature_names": FEATURE_NAMES}, self.path)
 
-    # -- training -----------------------------------------------------------
-    def fit(self, X: np.ndarray, y: List[str]) -> dict:
-        try:
-            from sklearn.ensemble import RandomForestClassifier
-            from sklearn.metrics import accuracy_score
-            from sklearn.model_selection import KFold, StratifiedKFold, cross_val_predict
-        except ImportError as e:                                           # pragma: no cover
-            raise RuntimeError("Training needs scikit-learn:  pip install scikit-learn") from e
-
+    # -- training (called from train.py, never from the dashboard) ---------
+    def fit(self, X: np.ndarray, y: List[str], *, ref: Optional[dict], normalize: str, detect: dict,
+            evaluation: Optional[dict], trees: int = 300, seed: int = 0, extra: Optional[dict] = None) -> dict:
         counts = Counter(y)
         if len(y) < MIN_SAMPLES or len(counts) < MIN_CLASSES:
-            raise ValueError(f"Label at least {MIN_SAMPLES} grains covering at least {MIN_CLASSES} different "
-                             f"types before training (you have {len(y)} grains, {len(counts)} type"
-                             f"{'' if len(counts) == 1 else 's'}).")
-
-        def make():
-            return RandomForestClassifier(n_estimators=300, class_weight="balanced_subsample",
-                                          min_samples_leaf=1, random_state=0, n_jobs=1)
-
-        # Cross-validation: grains from the same photo are similar, so this is only a sanity check.
-        cv = {"accuracy": None, "folds": 0, "per_class": {}, "note": ""}
-        ya = np.array(y)
-        min_c = min(counts.values())
-        try:
-            if min_c >= 2:
-                k = int(min(5, min_c))
-                splitter = StratifiedKFold(n_splits=k, shuffle=True, random_state=0)
-            elif len(y) >= 6:
-                k = int(min(5, len(y)))
-                splitter = KFold(n_splits=k, shuffle=True, random_state=0)
-                cv["note"] = "A type has only one example, so the check is rough."
-            else:
-                splitter, k = None, 0
-                cv["note"] = "Too few labelled grains for a cross-check."
-            if splitter is not None:
-                pred = cross_val_predict(make(), X, ya, cv=splitter)
-                cv["accuracy"] = float(accuracy_score(ya, pred))
-                cv["folds"] = k
-                for c in counts:
-                    m = ya == c
-                    cv["per_class"][c] = {"n": int(m.sum()), "correct": int((pred[m] == c).sum())}
-        except Exception as e:                                             # never block training on the check
-            cv["note"] = f"Cross-check skipped ({type(e).__name__})."
-
-        clf = make().fit(X, ya)
+            raise ValueError(f"Need at least {MIN_SAMPLES} grains covering at least {MIN_CLASSES} different types "
+                             f"(found {len(y)} grains, {len(counts)} type{'' if len(counts) == 1 else 's'}).")
+        clf = make_classifier(trees, seed).fit(X, np.array(y))
+        order = np.argsort(clf.feature_importances_)[::-1][:10]
         meta = {"version": datetime.now().strftime("%Y%m%d%H%M%S"),
                 "trained_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 "n_samples": int(len(y)), "counts": {c: counts.get(c, 0) for c in CLASSES},
-                "classes": [str(c) for c in clf.classes_], "cv": cv}
+                "classes": [str(c) for c in clf.classes_], "trees": trees,
+                "normalize": normalize, "reference": ref, "detect": detect,
+                "evaluation": evaluation,
+                "top_features": [[FEATURE_NAMES[i], round(float(clf.feature_importances_[i]), 4)] for i in order],
+                **(extra or {})}
         with self.lock:
-            self.clf, self.meta = clf, meta
-            self._save()
+            self.clf, self.meta, self.error = clf, meta, ""
+            self.save()
+            self._stamp = self._file_stamp()
         return meta
-
-    def reset(self):
-        with self.lock:
-            self.clf, self.meta = None, {}
-            try:
-                self.path.unlink()
-            except FileNotFoundError:
-                pass
 
     # -- inference ----------------------------------------------------------
     @property
     def trained(self) -> bool:
         return self.clf is not None
 
+    @property
+    def reference(self) -> Optional[dict]:
+        """Reference grain stored in the model (None = per-photo normalisation)."""
+        return self.meta.get("reference") if self.meta.get("normalize") == "reference" else None
+
+    @property
+    def version(self) -> str:
+        return self.meta.get("version") or ""
+
     def predict(self, X: np.ndarray) -> List[dict]:
         if not self.trained:
-            raise RuntimeError("No trained model yet.")
+            raise RuntimeError("No trained model found. Run  python train.py  first.")
         if len(X) == 0:
             return []
         with self.lock:
@@ -326,8 +321,13 @@ class GrainModel:
         return out
 
     def info(self) -> dict:
+        base = {"file": str(self.path.relative_to(BASE)) if self.path.is_relative_to(BASE) else str(self.path),
+                "file_exists": self.path.is_file(), "error": self.error}
         if not self.trained:
-            return {"trained": False, "version": None}
-        return {"trained": True, "version": self.meta.get("version"), "trained_at": self.meta.get("trained_at"),
-                "n_samples": self.meta.get("n_samples"), "counts": self.meta.get("counts"),
-                "classes": self.meta.get("classes"), "cv": self.meta.get("cv")}
+            return {**base, "trained": False, "version": None}
+        m = self.meta
+        return {**base, "trained": True, "version": m.get("version"), "trained_at": m.get("trained_at"),
+                "n_samples": m.get("n_samples"), "counts": m.get("counts"), "classes": m.get("classes"),
+                "normalize": m.get("normalize", "photo"), "detect": m.get("detect"),
+                "evaluation": m.get("evaluation"), "top_features": m.get("top_features"),
+                "n_photos": m.get("n_photos"), "source": m.get("source", "terminal")}
